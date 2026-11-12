@@ -1,0 +1,17 @@
+# Local databases for tests and manual testing.
+#   docker compose -f dev/docker-compose.yml up -d --wait
+name: good-query-dev
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_PASSWORD: postgres
+    volumes:
+      - ./demo.sql:/docker-entrypoint-initdb.d/01-demo.sql:ro
+    ports:
+      - "55432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U postgres"]
+      interval: 1s
+      timeout: 3s
+      retries: 120

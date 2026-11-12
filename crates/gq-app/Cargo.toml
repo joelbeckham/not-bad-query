@@ -1,0 +1,22 @@
+[package]
+name = "gq-app"
+description = "good-query desktop UI (GPUI)"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "good-query"
+path = "src/main.rs"
+
+[dependencies]
+gpui-kit = { version = "0.9.1", features = ["tree-sitter-sql"] }
+gq-core.workspace = true
+gq-driver.workspace = true
+gq-engine.workspace = true
+gq-sql.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+lsp-types = { version = "0.97", features = ["proposed"] }
+rfd = "0.18"
