@@ -1,13 +1,17 @@
-//! Configuration persisted as hand-editable TOML in the user's config dir:
+//! Configuration.
 //!
-//! * `connections.toml`: connections and the folders that organize them.
-//!   Folders are `/`-separated paths, e.g. `"Prod/US"`.
-//! * `settings.toml`: app settings (scripts folder, fetch sizes, ...).
+//! * Projects ([`project`]): folders holding connections and scripts, often
+//!   inside a git repo.
+//! * App config in the user's config dir: `settings.toml` (preferences) and
+//!   `workspace.toml` (which projects are open).
 //!
-//! Passwords never touch these files; they live in the OS credential store.
+//! Usernames and passwords never touch any file; they live in the OS
+//! credential store ([`secrets`]).
 
 mod color;
+pub mod project;
 mod tree;
+pub mod watch;
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -16,6 +20,8 @@ use gq_driver::{ConnectParams, DbKind, SslMode};
 use serde::{Deserialize, Serialize};
 
 pub use color::{ConnColor, PALETTE};
+pub use project::{LocalState, Project, ProjectMeta};
+pub use secrets::Credentials;
 pub use tree::{FolderNode, build_tree};
 
 #[derive(Debug, thiserror::Error)]
@@ -28,21 +34,29 @@ pub enum ConfigError {
     Serialize(#[from] toml::ser::Error),
     #[error("credential store: {0}")]
     Secret(String),
+    #[error("{0}")]
+    Project(String),
+    #[error("file watcher: {0}")]
+    Watch(String),
 }
 
 pub type Result<T, E = ConfigError> = std::result::Result<T, E>;
 
+/// A connection as stored in `connections/<folder>/<name>.toml`. The name
+/// and folder come from the file path; the credentials from the OS store.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Connection {
+    /// Stable id (survives renames); keys the stored credentials.
+    #[serde(default)]
     pub id: String,
+    #[serde(skip)]
     pub name: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip)]
     pub folder: Option<String>,
     pub kind: DbKind,
     pub host: String,
     pub port: u16,
     pub database: String,
-    pub user: String,
     #[serde(default)]
     pub ssl: SslMode,
     /// Palette name (`"red"`) or `#rrggbb`.
@@ -51,9 +65,12 @@ pub struct Connection {
     /// Default commit mode for tabs using this connection.
     #[serde(default = "yes")]
     pub autocommit: bool,
-    /// Store the password in the OS credential store.
-    #[serde(default = "yes")]
-    pub save_password: bool,
+    /// The owning project's runtime key (see [`Project::key`]).
+    #[serde(skip)]
+    pub project_key: u32,
+    /// The owning project's stable id.
+    #[serde(skip)]
+    pub project_id: String,
 }
 
 fn yes() -> bool {
@@ -76,26 +93,37 @@ impl Connection {
                 DbKind::Postgres => "postgres".into(),
                 DbKind::Redshift => "dev".into(),
             },
-            user: String::new(),
             ssl: SslMode::Prefer,
             color: None,
             autocommit: true,
-            save_password: true,
+            project_key: 0,
+            project_id: String::new(),
         }
+    }
+
+    /// Unique within this process (engine caches, tree ids, catalogs).
+    pub fn key(&self) -> String {
+        format!("{}:{}", self.project_key, self.id)
+    }
+
+    /// Credential store key: stable across runs.
+    pub fn secret_key(&self) -> String {
+        format!("{}/{}", self.project_id, self.id)
     }
 
     pub fn color(&self) -> Option<ConnColor> {
         self.color.as_deref().and_then(ConnColor::parse)
     }
 
-    pub fn params(&self, password: Option<String>) -> ConnectParams {
+    pub fn params(&self, creds: Option<Credentials>) -> ConnectParams {
+        let creds = creds.unwrap_or_default();
         ConnectParams {
             kind: self.kind,
             host: self.host.clone(),
             port: self.port,
             database: self.database.clone(),
-            user: self.user.clone(),
-            password,
+            user: creds.user,
+            password: creds.password,
             ssl: self.ssl,
             connect_timeout: Duration::from_secs(10),
             application_name: "good-query".into(),
@@ -103,12 +131,11 @@ impl Connection {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+/// A project's connections plus its (possibly empty) folders.
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct Connections {
     /// Every folder path, including empty ones. Parents are implied.
-    #[serde(default)]
     pub folders: Vec<String>,
-    #[serde(default, rename = "connection")]
     pub connections: Vec<Connection>,
 }
 
@@ -137,8 +164,6 @@ impl Connections {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
-    /// Root of the SQL script tree.
-    pub scripts_dir: Option<PathBuf>,
     pub dark: bool,
     pub editor_font_size: f32,
     pub initial_rows: u64,
@@ -151,7 +176,6 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Settings {
-            scripts_dir: None,
             dark: true,
             editor_font_size: 14.0,
             initial_rows: 500,
@@ -162,7 +186,55 @@ impl Default for Settings {
     }
 }
 
-/// Where config files live. `Store::default_location()` is the user config
+/// Which projects are open (restored on startup) and recently used.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Workspace {
+    pub open: Vec<PathBuf>,
+    pub recent: Vec<PathBuf>,
+}
+
+impl Workspace {
+    const MAX_RECENT: usize = 10;
+
+    pub fn opened(&mut self, root: &Path) {
+        if !self.open.iter().any(|p| p == root) {
+            self.open.push(root.to_path_buf());
+        }
+        self.recent.retain(|p| p != root);
+        self.recent.insert(0, root.to_path_buf());
+        self.recent.truncate(Self::MAX_RECENT);
+    }
+
+    pub fn closed(&mut self, root: &Path) {
+        self.open.retain(|p| p != root);
+    }
+}
+
+/// Read a TOML file; `None` if it doesn't exist.
+pub(crate) fn read_toml<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<Option<T>> {
+    match std::fs::read_to_string(path) {
+        Ok(s) => toml::from_str(&s).map(Some).map_err(|source| ConfigError::Parse { path: path.to_path_buf(), source }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(ConfigError::Io { path: path.to_path_buf(), source }),
+    }
+}
+
+/// Write via a temp file + rename so a crash never leaves a torn file.
+pub(crate) fn write_atomic(path: &Path, text: &str) -> Result<()> {
+    let io = |p: &Path| {
+        let p = p.to_path_buf();
+        move |source| ConfigError::Io { path: p, source }
+    };
+    let dir = path.parent().unwrap_or(Path::new("."));
+    std::fs::create_dir_all(dir).map_err(io(dir))?;
+    let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+    let tmp = dir.join(format!(".{name}.tmp"));
+    std::fs::write(&tmp, text).map_err(io(&tmp))?;
+    std::fs::rename(&tmp, path).map_err(io(path))
+}
+
+/// Where app config lives. `Store::default_location()` is the user config
 /// dir; tests point it at a temp dir.
 #[derive(Debug, Clone)]
 pub struct Store {
@@ -191,33 +263,11 @@ impl Store {
     }
 
     fn load<T: Default + for<'de> Deserialize<'de>>(&self, name: &str) -> Result<T> {
-        let path = self.dir.join(name);
-        match std::fs::read_to_string(&path) {
-            Ok(s) => toml::from_str(&s).map_err(|source| ConfigError::Parse { path, source }),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(T::default()),
-            Err(source) => Err(ConfigError::Io { path, source }),
-        }
+        Ok(read_toml(&self.dir.join(name))?.unwrap_or_default())
     }
 
-    /// Write via a temp file + rename so a crash never leaves a torn file.
     fn save<T: Serialize>(&self, name: &str, value: &T) -> Result<()> {
-        let io = |path: &Path| {
-            let path = path.to_path_buf();
-            move |source| ConfigError::Io { path, source }
-        };
-        std::fs::create_dir_all(&self.dir).map_err(io(&self.dir))?;
-        let path = self.dir.join(name);
-        let tmp = self.dir.join(format!(".{name}.tmp"));
-        std::fs::write(&tmp, toml::to_string_pretty(value)?).map_err(io(&tmp))?;
-        std::fs::rename(&tmp, &path).map_err(io(&path))
-    }
-
-    pub fn load_connections(&self) -> Result<Connections> {
-        self.load("connections.toml")
-    }
-
-    pub fn save_connections(&self, c: &Connections) -> Result<()> {
-        self.save("connections.toml", c)
+        write_atomic(&self.dir.join(name), &toml::to_string_pretty(value)?)
     }
 
     pub fn load_settings(&self) -> Result<Settings> {
@@ -227,32 +277,51 @@ impl Store {
     pub fn save_settings(&self, s: &Settings) -> Result<()> {
         self.save("settings.toml", s)
     }
+
+    pub fn load_workspace(&self) -> Result<Workspace> {
+        self.load("workspace.toml")
+    }
+
+    pub fn save_workspace(&self, w: &Workspace) -> Result<()> {
+        self.save("workspace.toml", w)
+    }
 }
 
-/// Passwords in the OS credential store (Windows Credential Manager).
+/// Credentials in the OS credential store (Windows Credential Manager),
+/// keyed by [`Connection::secret_key`].
 pub mod secrets {
+    use serde::{Deserialize, Serialize};
+
     use super::{ConfigError, Result};
 
     const SERVICE: &str = "good-query";
 
-    fn entry(conn_id: &str) -> Result<keyring::Entry> {
-        keyring::Entry::new(SERVICE, conn_id).map_err(|e| ConfigError::Secret(e.to_string()))
+    #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+    pub struct Credentials {
+        pub user: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub password: Option<String>,
     }
 
-    pub fn get(conn_id: &str) -> Result<Option<String>> {
-        match entry(conn_id)?.get_password() {
-            Ok(p) => Ok(Some(p)),
+    fn entry(key: &str) -> Result<keyring::Entry> {
+        keyring::Entry::new(SERVICE, key).map_err(|e| ConfigError::Secret(e.to_string()))
+    }
+
+    pub fn get(key: &str) -> Result<Option<Credentials>> {
+        match entry(key)?.get_password() {
+            Ok(s) => toml::from_str(&s).map(Some).map_err(|e| ConfigError::Secret(e.to_string())),
             Err(keyring::Error::NoEntry) => Ok(None),
             Err(e) => Err(ConfigError::Secret(e.to_string())),
         }
     }
 
-    pub fn set(conn_id: &str, password: &str) -> Result<()> {
-        entry(conn_id)?.set_password(password).map_err(|e| ConfigError::Secret(e.to_string()))
+    pub fn set(key: &str, creds: &Credentials) -> Result<()> {
+        let s = toml::to_string(creds)?;
+        entry(key)?.set_password(&s).map_err(|e| ConfigError::Secret(e.to_string()))
     }
 
-    pub fn delete(conn_id: &str) -> Result<()> {
-        match entry(conn_id)?.delete_credential() {
+    pub fn delete(key: &str) -> Result<()> {
+        match entry(key)?.delete_credential() {
             Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
             Err(e) => Err(ConfigError::Secret(e.to_string())),
         }
@@ -264,48 +333,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn round_trip_and_defaults() {
+    fn settings_and_workspace_round_trip() {
         let d = tempfile::tempdir().unwrap();
         let store = Store::new(d.path());
-        assert_eq!(store.load_connections().unwrap(), Connections::default());
         assert_eq!(store.load_settings().unwrap(), Settings::default());
+        assert_eq!(store.load_workspace().unwrap(), Workspace::default());
 
-        let mut cs = Connections::default();
-        let mut c = Connection::new("orders prod", DbKind::Postgres);
-        c.folder = Some("Prod/US".into());
-        c.color = Some("red".into());
-        c.autocommit = false;
-        cs.upsert(c.clone());
-        cs.folders.push("Empty".into());
-        store.save_connections(&cs).unwrap();
-        assert_eq!(store.load_connections().unwrap(), cs);
-        assert_eq!(cs.folders, ["Prod/US", "Empty"]);
-
-        let text = std::fs::read_to_string(d.path().join("connections.toml")).unwrap();
-        assert!(text.contains("[[connection]]"), "{text}");
-        assert!(!text.lines().any(|l| l.trim_start().starts_with("password")), "{text}");
+        let mut w = Workspace::default();
+        w.opened(Path::new("C:/a"));
+        w.opened(Path::new("C:/b"));
+        w.opened(Path::new("C:/a"));
+        w.closed(Path::new("C:/b"));
+        store.save_workspace(&w).unwrap();
+        let w2 = store.load_workspace().unwrap();
+        assert_eq!(w2.open, [PathBuf::from("C:/a")]);
+        assert_eq!(w2.recent, [PathBuf::from("C:/a"), PathBuf::from("C:/b")]);
     }
 
     #[test]
-    fn hand_written_file_with_missing_fields() {
-        let d = tempfile::tempdir().unwrap();
-        std::fs::write(
-            d.path().join("connections.toml"),
-            r#"
-[[connection]]
-id = "a"
-name = "local"
-kind = "postgres"
-host = "localhost"
-port = 5432
-database = "postgres"
-user = "me"
-"#,
-        )
-        .unwrap();
-        let cs = Store::new(d.path()).load_connections().unwrap();
-        let c = &cs.connections[0];
-        assert!(c.autocommit && c.save_password);
+    fn hand_written_connection_with_missing_fields() {
+        let c: Connection =
+            toml::from_str("kind = \"postgres\"\nhost = \"localhost\"\nport = 5432\ndatabase = \"postgres\"\n").unwrap();
+        assert!(c.autocommit && c.id.is_empty());
         assert_eq!(c.ssl, SslMode::Prefer);
     }
 

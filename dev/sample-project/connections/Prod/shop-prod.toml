@@ -1,0 +1,10 @@
+# The same dev database, set up the way you'd treat production:
+# red, and manual commit by default.
+id = "shop-prod"
+kind = "postgres"
+host = "127.0.0.1"
+port = 55432
+database = "postgres"
+ssl = "disable"
+color = "red"
+autocommit = false

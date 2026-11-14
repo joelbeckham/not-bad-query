@@ -23,6 +23,8 @@ actions!(
         ExportCsv,
         CopyCell,
         NewConnection,
+        NewProject,
+        OpenProject,
         CommandPalette,
         FocusEditor,
         FocusResults,
@@ -77,6 +79,8 @@ pub fn palette() -> Vec<(&'static str, &'static str, Box<dyn Action>)> {
         ("Save", "Ctrl+S", Box::new(SaveFile)),
         ("Save as…", "Ctrl+Shift+S", Box::new(SaveFileAs)),
         ("Export results to CSV…", "Ctrl+Shift+E", Box::new(ExportCsv)),
+        ("New project…", "", Box::new(NewProject)),
+        ("Open project…", "", Box::new(OpenProject)),
         ("New connection…", "", Box::new(NewConnection)),
         ("Toggle light/dark theme", "", Box::new(ToggleTheme)),
     ]

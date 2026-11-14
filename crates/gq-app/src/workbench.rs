@@ -1,11 +1,12 @@
 //! The window's root view: sidebar, tab strip, active tab, status bar.
-//! Owns the engine and the config, and routes engine events.
+//! Owns the engine, the open projects and app config, and routes events.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::Duration;
 
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -19,22 +20,23 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use gq_core::{Connection, Connections, Settings, Store};
+use gq_core::watch::ProjectWatcher;
+use gq_core::{Connection, Credentials, Project, Settings, Store, Workspace};
 use gq_engine::{ConnState, Engine, EngineOptions, Event, TabId};
 
 use crate::actions::*;
 use crate::complete::Catalogs;
 use crate::query_tab::QueryTab;
 use crate::sidebar::{Sidebar, SidebarEvent};
-use crate::ui::conn_color;
+use crate::ui::{Projects, conn_color, connection, project_for_path};
 
 pub struct Workbench {
     engine: Arc<Engine>,
     store: Store,
-    connections: Connections,
-    /// Shared with tabs for their connection pickers.
-    conn_list: Rc<RefCell<Vec<Connection>>>,
     settings: Settings,
+    workspace: Workspace,
+    projects: Projects,
+    watcher: Option<ProjectWatcher>,
     sidebar: Entity<Sidebar>,
     tabs: Vec<Entity<QueryTab>>,
     active: usize,
@@ -62,29 +64,53 @@ fn event_tab(ev: &Event) -> Option<TabId> {
     })
 }
 
+fn error(window: &mut Window, cx: &mut App, msg: impl Into<SharedString>) {
+    window.push_notification(Notification::error(msg.into()), cx);
+}
+
 impl Workbench {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let store = match std::env::var_os("GQ_CONFIG_DIR") {
             Some(d) => Store::new(PathBuf::from(d)),
             None => Store::default_location(),
         };
-        let mut load_errors = Vec::new();
+        let mut problems = Vec::new();
         let settings = store.load_settings().unwrap_or_else(|e| {
-            load_errors.push(e.to_string());
+            problems.push(e.to_string());
             Settings::default()
         });
-        let connections = store.load_connections().unwrap_or_else(|e| {
-            load_errors.push(e.to_string());
-            Connections::default()
+        let mut workspace = store.load_workspace().unwrap_or_else(|e| {
+            problems.push(e.to_string());
+            Workspace::default()
         });
         Theme::change(if settings.dark { ThemeMode::Dark } else { ThemeMode::Light }, Some(window), cx);
+
+        let mut watcher = ProjectWatcher::new().map_err(|e| problems.push(e.to_string())).ok();
+        let mut projects = Vec::new();
+        for root in workspace.open.clone() {
+            match Project::open(&root) {
+                Ok(p) => {
+                    problems.extend(p.warnings.iter().cloned());
+                    if let Some(w) = watcher.as_mut() {
+                        if let Err(e) = w.watch(&p.root) {
+                            problems.push(e.to_string());
+                        }
+                    }
+                    projects.push(p);
+                }
+                Err(e) => {
+                    problems.push(format!("Could not open project: {e}"));
+                    workspace.closed(&root);
+                }
+            }
+        }
+        let projects: Projects = Rc::new(RefCell::new(projects));
 
         let mut opts = EngineOptions::new(Store::default_spool_dir());
         opts.initial_rows = settings.initial_rows;
         let (engine, mut rx) = Engine::new(opts);
 
-        let sidebar =
-            cx.new(|cx| Sidebar::new(engine.clone(), connections.clone(), settings.scripts_dir.clone(), window, cx));
+        let sidebar = cx.new(|cx| Sidebar::new(engine.clone(), projects.clone(), workspace.recent.clone(), cx));
         let subs = vec![cx.subscribe_in(&sidebar, window, |this, _, ev: &SidebarEvent, window, cx| {
             this.on_sidebar(ev, window, cx)
         })];
@@ -95,13 +121,24 @@ impl Workbench {
                 }
             }
         });
+        // Outside changes to project folders (git pull, an editor): poll the
+        // watcher's change set; cheap when nothing changed.
+        let watch = cx.spawn_in(window, async move |this, cx| {
+            loop {
+                cx.background_executor().timer(Duration::from_millis(400)).await;
+                if this.update_in(cx, |wb, window, cx| wb.poll_watcher(window, cx)).is_err() {
+                    break;
+                }
+            }
+        });
         let palette = cx.new(|cx| CommandState::new(window, cx));
         let mut wb = Workbench {
             engine,
             store,
-            conn_list: Rc::new(RefCell::new(connections.connections.clone())),
-            connections,
             settings,
+            workspace,
+            projects,
+            watcher,
             sidebar,
             tabs: Vec::new(),
             active: 0,
@@ -110,13 +147,13 @@ impl Workbench {
             close_armed: None,
             palette,
             focus: cx.focus_handle(),
-            _tasks: vec![events],
+            _tasks: vec![events, watch],
             _subs: subs,
         };
-        let first = wb.connections.connections.first().cloned();
-        wb.new_tab(first, window, cx);
-        for e in load_errors {
-            window.push_notification(Notification::error(format!("Config error: {e}")), cx);
+        let first = wb.projects.borrow().first().and_then(|p| p.connections.connections.first().cloned());
+        wb.new_tab(first, None, window, cx);
+        for e in problems {
+            error(window, cx, e);
         }
         wb
     }
@@ -138,19 +175,32 @@ impl Workbench {
         }
     }
 
-    pub fn new_tab(&mut self, conn: Option<Connection>, window: &mut Window, cx: &mut Context<Self>) -> Entity<QueryTab> {
+    /// The project new things go into: the active tab's, else the only/first one.
+    fn current_project(&self, cx: &App) -> Option<u32> {
+        self.active_tab()
+            .and_then(|t| t.read(cx).project)
+            .or_else(|| self.projects.borrow().first().map(|p| p.key))
+    }
+
+    pub fn new_tab(
+        &mut self,
+        conn: Option<Connection>,
+        project: Option<u32>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<QueryTab> {
         let n = self.next_untitled;
         self.next_untitled += 1;
-        let (engine, catalogs, settings, list) =
-            (self.engine.clone(), self.catalogs.clone(), self.settings.clone(), self.conn_list.clone());
+        let (engine, catalogs, settings, projects) =
+            (self.engine.clone(), self.catalogs.clone(), self.settings.clone(), self.projects.clone());
         let tab = cx.new(|cx| {
-            let mut t = QueryTab::new(engine, catalogs, list, n, &settings, window, cx);
+            let mut t = QueryTab::new(engine, catalogs, projects, n, &settings, window, cx);
+            t.project = project;
             if conn.is_some() {
                 t.set_connection(conn, cx);
             }
             t
         });
-        // Tabs ask the workbench to load the catalog when they connect.
         self.tabs.push(tab.clone());
         self.active = self.tabs.len() - 1;
         self.focus_editor(window, cx);
@@ -158,12 +208,16 @@ impl Workbench {
         tab
     }
 
+    /// Whether closing would lose something: (unsaved edits, uncommitted changes).
+    fn tab_risk(&self, tab: &Entity<QueryTab>, cx: &App) -> (bool, bool) {
+        let t = tab.read(cx);
+        (t.dirty && !t.text(cx).trim().is_empty(), t.txn.in_txn && t.txn.pending_writes > 0)
+    }
+
     fn close_tab(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(tab) = self.tabs.get(ix).cloned() else { return };
-        let (dirty, pending, id) = {
-            let t = tab.read(cx);
-            (t.dirty && !t.text(cx).trim().is_empty(), t.txn.in_txn && t.txn.pending_writes > 0, tab.entity_id())
-        };
+        let (dirty, pending) = self.tab_risk(&tab, cx);
+        let id = tab.entity_id();
         if (dirty || pending) && self.close_armed != Some(id) {
             self.close_armed = Some(id);
             let what = match (dirty, pending) {
@@ -181,8 +235,11 @@ impl Workbench {
         self.engine.close_tab(tab.read(cx).engine_tab);
         self.tabs.remove(ix);
         if self.tabs.is_empty() {
-            let conn = tab.read(cx).conn.clone();
-            self.new_tab(conn, window, cx);
+            let (conn, project) = {
+                let t = tab.read(cx);
+                (t.conn.clone(), t.project)
+            };
+            self.new_tab(conn, project, window, cx);
         } else {
             self.active = self.active.min(self.tabs.len() - 1);
             if ix < self.active {
@@ -209,8 +266,8 @@ impl Workbench {
                 let Some(tab) = self.tabs.iter().find(|t| t.read(cx).engine_tab == tab_id).cloned() else { return };
                 if let Event::Conn { state: ConnState::Connected, .. } = &ev {
                     if let Some(c) = tab.read(cx).conn.clone() {
-                        if !self.catalogs.borrow().contains_key(&c.id) {
-                            self.engine.load_catalog(&c.id, &crate::ui::params_for(&c));
+                        if !self.catalogs.borrow().contains_key(&c.key()) {
+                            self.engine.load_catalog(&c.key(), &crate::ui::params_for(&c));
                         }
                     }
                 }
@@ -220,37 +277,42 @@ impl Workbench {
         }
     }
 
+    fn reuse_empty_tab(&self, cx: &App) -> Option<Entity<QueryTab>> {
+        self.active_tab().cloned().filter(|t| {
+            let t = t.read(cx);
+            t.path.is_none() && t.text(cx).trim().is_empty() && !t.is_running()
+        })
+    }
+
     fn on_sidebar(&mut self, ev: &SidebarEvent, window: &mut Window, cx: &mut Context<Self>) {
         match ev {
-            SidebarEvent::OpenConnection(id) => {
-                let c = self.connections.get(id).cloned();
-                // Reuse an empty untitled tab without a connection.
-                if let Some(t) = self.active_tab().cloned() {
-                    let reuse = {
-                        let t = t.read(cx);
-                        t.path.is_none() && t.text(cx).trim().is_empty() && !t.is_running()
-                    };
-                    if reuse {
-                        t.update(cx, |t, cx| t.set_connection(c, cx));
-                        self.focus_editor(window, cx);
-                        return;
-                    }
+            SidebarEvent::OpenConnection(key) => {
+                let c = connection(&self.projects.borrow(), key);
+                let project = c.as_ref().map(|c| c.project_key);
+                if let Some(t) = self.reuse_empty_tab(cx) {
+                    t.update(cx, |t, cx| {
+                        t.project = project;
+                        t.set_connection(c, cx)
+                    });
+                    self.focus_editor(window, cx);
+                    return;
                 }
-                self.new_tab(c, window, cx);
+                self.new_tab(c, project, window, cx);
             }
             SidebarEvent::OpenScript(p) => self.open_path(p.clone(), window, cx),
-            SidebarEvent::NewConnection => self.edit_connection(None, window, cx),
-            SidebarEvent::EditConnection(id) => {
-                let c = self.connections.get(id).cloned();
-                self.edit_connection(c, window, cx)
+            SidebarEvent::NewConnection { project, folder } => {
+                self.edit_connection(*project, None, folder.clone(), window, cx)
             }
-            SidebarEvent::DeleteConnection(id) => {
-                self.connections.remove(id);
-                let _ = gq_core::secrets::delete(id);
-                self.save_connections(window, cx);
+            SidebarEvent::EditConnection(key) => {
+                let c = connection(&self.projects.borrow(), key);
+                if let Some(c) = c {
+                    self.edit_connection(c.project_key, Some(c), None, window, cx)
+                }
             }
+            SidebarEvent::DeleteConnection(key) => self.delete_connection(key, window, cx),
             SidebarEvent::SelectFrom { conn, schema, name } => {
-                let c = self.connections.get(conn).cloned();
+                let c = connection(&self.projects.borrow(), conn);
+                let project = c.as_ref().map(|c| c.project_key);
                 let q = |s: &str| {
                     if s.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_') {
                         s.to_string()
@@ -259,70 +321,319 @@ impl Workbench {
                     }
                 };
                 let sql = format!("select *\nfrom {}.{}", q(schema), q(name));
-                let tab = self.new_tab(c, window, cx);
+                let tab = self.new_tab(c, project, window, cx);
                 tab.update(cx, |t, cx| {
                     t.editor.update(cx, |e, cx| e.set_value(sql.as_str(), window, cx));
                     t.run_statement(cx);
                 });
             }
-            SidebarEvent::ChooseScriptsDir => {
-                cx.spawn_in(window, async move |this, cx| {
-                    let Some(dir) = rfd::AsyncFileDialog::new().pick_folder().await else { return };
-                    let dir = dir.path().to_path_buf();
-                    let _ = this.update_in(cx, |wb, window, cx| {
-                        wb.settings.scripts_dir = Some(dir.clone());
-                        if let Err(e) = wb.store.save_settings(&wb.settings) {
-                            window.push_notification(Notification::error(e.to_string()), cx);
-                        }
-                        wb.sidebar.update(cx, |s, cx| s.set_scripts_dir(Some(dir), cx));
-                    });
-                })
-                .detach();
+            SidebarEvent::NewScript { project, dir } => {
+                let conn = self
+                    .active_tab()
+                    .and_then(|t| t.read(cx).conn.clone())
+                    .filter(|c| c.project_key == *project);
+                let tab = match self.reuse_empty_tab(cx) {
+                    Some(t) => {
+                        t.update(cx, |t, cx| {
+                            t.project = Some(*project);
+                            if t.conn.as_ref().is_some_and(|c| c.project_key != *project) {
+                                t.set_connection(None, cx);
+                            }
+                        });
+                        t
+                    }
+                    None => self.new_tab(conn, Some(*project), window, cx),
+                };
+                let dir = dir.clone();
+                tab.update(cx, |t, _| t.save_dir = Some(dir));
+                self.focus_editor(window, cx);
+            }
+            SidebarEvent::NewProject => self.new_project(window, cx),
+            SidebarEvent::OpenProject(None) => self.pick_project(window, cx),
+            SidebarEvent::OpenProject(Some(root)) => self.open_project(root.clone(), window, cx),
+            SidebarEvent::CloseProject(key) => self.close_project(*key, window, cx),
+        }
+    }
+
+    // ---- projects ----
+
+    fn save_workspace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Err(e) = self.store.save_workspace(&self.workspace) {
+            error(window, cx, format!("Could not save workspace: {e}"));
+        }
+        let recent = self.workspace.recent.clone();
+        self.sidebar.update(cx, |s, cx| {
+            s.set_recent(recent, cx);
+            s.refresh(cx);
+        });
+        cx.notify();
+    }
+
+    fn add_project(&mut self, p: Project, window: &mut Window, cx: &mut Context<Self>) {
+        for w in &p.warnings {
+            error(window, cx, w.clone());
+        }
+        if let Some(w) = self.watcher.as_mut() {
+            if let Err(e) = w.watch(&p.root) {
+                error(window, cx, e.to_string());
+            }
+        }
+        self.workspace.opened(&p.root);
+        let key = p.key;
+        self.projects.borrow_mut().push(p);
+        self.save_workspace(window, cx);
+        // An empty, project-less tab joins the new project.
+        if let Some(t) = self.reuse_empty_tab(cx) {
+            t.update(cx, |t, _| {
+                if t.project.is_none() {
+                    t.project = Some(key);
+                }
+            });
+        }
+    }
+
+    fn open_project(&mut self, root: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        if self.projects.borrow().iter().any(|p| p.root == root) {
+            return;
+        }
+        match Project::open(&root) {
+            Ok(p) => self.add_project(p, window, cx),
+            Err(e) => {
+                error(window, cx, e.to_string());
+                if !root.exists() {
+                    self.workspace.recent.retain(|r| r != &root);
+                    self.save_workspace(window, cx);
+                }
             }
         }
     }
 
-    fn save_connections(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Err(e) = self.store.save_connections(&self.connections) {
-            window.push_notification(Notification::error(format!("Could not save connections: {e}")), cx);
+    fn pick_project(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        cx.spawn_in(window, async move |this, cx| {
+            let Some(dir) = rfd::AsyncFileDialog::new().set_title("Open good-query project").pick_folder().await else {
+                return;
+            };
+            let root = dir.path().to_path_buf();
+            let _ = this.update_in(cx, |wb, window, cx| {
+                if Project::is_project(&root) {
+                    wb.open_project(root, window, cx);
+                } else {
+                    error(
+                        window,
+                        cx,
+                        format!(
+                            "{} is not a good-query project. Use \"New project…\" to make it one.",
+                            root.display()
+                        ),
+                    );
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Pick a folder (new or existing, e.g. `repo/queries`) and make it a project.
+    fn new_project(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        cx.spawn_in(window, async move |this, cx| {
+            let Some(dir) =
+                rfd::AsyncFileDialog::new().set_title("Choose or create a folder for the project").pick_folder().await
+            else {
+                return;
+            };
+            let root = dir.path().to_path_buf();
+            let _ = this.update_in(cx, |wb, window, cx| {
+                if Project::is_project(&root) {
+                    // Already one: just open it.
+                    wb.open_project(root, window, cx);
+                    return;
+                }
+                match Project::create(&root, "") {
+                    Ok(p) => {
+                        let key = p.key;
+                        wb.add_project(p, window, cx);
+                        wb.edit_connection(key, None, None, window, cx);
+                    }
+                    Err(e) => error(window, cx, e.to_string()),
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn close_project(&mut self, key: u32, window: &mut Window, cx: &mut Context<Self>) {
+        let tabs: Vec<_> = self.tabs.iter().filter(|t| t.read(cx).project == Some(key)).cloned().collect();
+        if tabs.iter().any(|t| {
+            let (dirty, pending) = self.tab_risk(t, cx);
+            dirty || pending
+        }) {
+            window.push_notification(
+                Notification::warning("Save or close this project's tabs with unsaved edits or uncommitted changes first."),
+                cx,
+            );
+            return;
         }
-        *self.conn_list.borrow_mut() = self.connections.connections.clone();
-        let c = self.connections.clone();
-        self.sidebar.update(cx, |s, cx| s.set_connections(c, cx));
+        for t in &tabs {
+            self.engine.close_tab(t.read(cx).engine_tab);
+        }
+        self.tabs.retain(|t| !tabs.contains(t));
+        let removed = {
+            let mut ps = self.projects.borrow_mut();
+            let ix = ps.iter().position(|p| p.key == key);
+            ix.map(|ix| ps.remove(ix))
+        };
+        if let Some(p) = removed {
+            for c in &p.connections.connections {
+                self.engine.forget_connection(&c.key());
+                self.catalogs.borrow_mut().remove(&c.key());
+            }
+            if let Some(w) = self.watcher.as_mut() {
+                w.unwatch(&p.root);
+            }
+            self.workspace.closed(&p.root);
+        }
+        if self.tabs.is_empty() {
+            self.new_tab(None, None, window, cx);
+        }
+        self.active = self.active.min(self.tabs.len() - 1);
+        self.save_workspace(window, cx);
+    }
+
+    /// Reload projects whose files changed outside the app.
+    fn poll_watcher(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(w) = &self.watcher else { return };
+        let changed = w.take_changed();
+        if changed.is_empty() {
+            return;
+        }
+        let mut reloaded = Vec::new();
+        for p in self.projects.borrow_mut().iter_mut() {
+            if changed.iter().any(|c| p.is_relevant_change(c)) {
+                let before = p.connections.connections.clone();
+                if let Err(e) = p.reload() {
+                    error(window, cx, e.to_string());
+                }
+                reloaded.push((before, p.connections.connections.clone()));
+            }
+        }
+        if reloaded.is_empty() {
+            return;
+        }
+        for (before, after) in reloaded {
+            for old in &before {
+                if after.iter().any(|n| n.key() == old.key() && n != old) {
+                    self.connection_changed(old, window, cx);
+                }
+            }
+        }
+        self.sidebar.update(cx, |s, cx| s.refresh(cx));
         cx.notify();
     }
 
-    fn edit_connection(&mut self, existing: Option<Connection>, window: &mut Window, cx: &mut Context<Self>) {
+    // ---- connections ----
+
+    /// A connection's settings changed: drop caches and reconnect its tabs.
+    fn connection_changed(&mut self, old: &Connection, _window: &mut Window, cx: &mut Context<Self>) {
+        let key = old.key();
+        self.engine.forget_connection(&key);
+        self.catalogs.borrow_mut().remove(&key);
+        self.sidebar.update(cx, |s, cx| s.forget_connection(&key, cx));
+        let new = connection(&self.projects.borrow(), &key);
+        for t in self.tabs.clone() {
+            if t.read(cx).conn.as_ref().is_some_and(|x| x.key() == key) {
+                t.update(cx, |t, cx| t.set_connection(new.clone(), cx));
+            }
+        }
+    }
+
+    fn edit_connection(
+        &mut self,
+        project: u32,
+        existing: Option<Connection>,
+        folder: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let user = existing.as_ref().and_then(crate::ui::credentials).map(|c| c.user).unwrap_or_default();
         let this = cx.weak_entity();
-        crate::conn_dialog::open(existing, window, cx, move |c, password, window, cx| {
-            let _ = this.update(cx, |wb, cx| {
-                if let Some(pw) = password.filter(|_| c.save_password) {
-                    if let Err(e) = gq_core::secrets::set(&c.id, &pw) {
-                        window.push_notification(Notification::error(format!("Could not store password: {e}")), cx);
-                    }
-                }
-                if !c.save_password {
-                    let _ = gq_core::secrets::delete(&c.id);
-                }
-                wb.engine.forget_connection(&c.id);
-                wb.catalogs.borrow_mut().remove(&c.id);
-                wb.connections.upsert(c.clone());
-                wb.save_connections(window, cx);
-                // Tabs on this connection reconnect with the new settings.
-                for t in wb.tabs.clone() {
-                    if t.read(cx).conn.as_ref().is_some_and(|x| x.id == c.id) {
-                        t.update(cx, |t, cx| t.set_connection(Some(c.clone()), cx));
-                    }
-                }
-                // A brand-new connection: put it on the empty tab.
-                if let Some(t) = wb.active_tab().cloned() {
-                    if t.read(cx).conn.is_none() {
-                        t.update(cx, |t, cx| t.set_connection(Some(c.clone()), cx));
-                    }
-                }
-            });
+        crate::conn_dialog::open(existing.clone(), folder, user, window, cx, move |c, user, password, window, cx| {
+            let _ = this.update(cx, |wb, cx| wb.save_connection(project, existing.clone(), c, user, password, window, cx));
         });
     }
+
+    #[allow(clippy::too_many_arguments)]
+    fn save_connection(
+        &mut self,
+        project: u32,
+        old: Option<Connection>,
+        c: Connection,
+        user: String,
+        password: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let saved = {
+            let mut ps = self.projects.borrow_mut();
+            let Some(p) = ps.iter_mut().find(|p| p.key == project) else { return };
+            p.save_connection(c)
+        };
+        let c = match saved {
+            Ok(c) => c,
+            Err(e) => return error(window, cx, format!("Could not save connection: {e}")),
+        };
+        // Keep the stored password when the field was left empty.
+        let password = password.or_else(|| crate::ui::credentials(&c).and_then(|x| x.password));
+        if let Err(e) = gq_core::secrets::set(&c.secret_key(), &Credentials { user, password }) {
+            error(window, cx, format!("Could not store credentials: {e}"));
+        }
+        match old {
+            Some(old) => self.connection_changed(&old, window, cx),
+            None => {
+                // A brand-new connection: put it on an empty tab of this project.
+                if let Some(t) = self.active_tab().cloned() {
+                    let fits = {
+                        let t = t.read(cx);
+                        t.conn.is_none() && t.project.is_none_or(|k| k == project)
+                    };
+                    if fits {
+                        t.update(cx, |t, cx| t.set_connection(Some(c.clone()), cx));
+                    }
+                }
+            }
+        }
+        self.sidebar.update(cx, |s, cx| s.refresh(cx));
+        cx.notify();
+    }
+
+    fn delete_connection(&mut self, key: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(c) = connection(&self.projects.borrow(), key) else { return };
+        let res = {
+            let mut ps = self.projects.borrow_mut();
+            match ps.iter_mut().find(|p| p.key == c.project_key) {
+                Some(p) => p.delete_connection(&c.id),
+                None => return,
+            }
+        };
+        if let Err(e) = res {
+            return error(window, cx, format!("Could not delete connection: {e}"));
+        }
+        let _ = gq_core::secrets::delete(&c.secret_key());
+        self.engine.forget_connection(key);
+        self.catalogs.borrow_mut().remove(key);
+        self.sidebar.update(cx, |s, cx| s.refresh(cx));
+        cx.notify();
+    }
+
+    fn new_connection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match self.current_project(cx) {
+            Some(p) => self.edit_connection(p, None, None, window, cx),
+            None => window.push_notification(
+                Notification::warning("Create or open a project first: connections live in a project."),
+                cx,
+            ),
+        }
+    }
+
+    // ---- files ----
 
     fn open_path(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(ix) = self.tabs.iter().position(|t| t.read(cx).path.as_ref() == Some(&path)) {
@@ -333,44 +644,57 @@ impl Workbench {
         }
         let text = match std::fs::read_to_string(&path) {
             Ok(t) => t,
-            Err(e) => {
-                window.push_notification(Notification::error(format!("{}: {e}", path.display())), cx);
-                return;
-            }
+            Err(e) => return error(window, cx, format!("{}: {e}", path.display())),
         };
-        let conn = self.active_tab().and_then(|t| t.read(cx).conn.clone());
-        // Replace an empty untitled tab rather than piling up tabs.
-        let reuse = self.active_tab().cloned().filter(|t| {
-            let t = t.read(cx);
-            t.path.is_none() && t.text(cx).trim().is_empty() && !t.is_running()
-        });
-        let tab = match reuse {
+        // The script's remembered connection; else keep the current one if
+        // it's from the same project.
+        let (project, conn) = {
+            let ps = self.projects.borrow();
+            let project = project_for_path(&ps, &path);
+            let remembered = project
+                .and_then(|k| crate::ui::project(&ps, k))
+                .and_then(|p| p.script_connection(&path).cloned());
+            let current = self.active_tab().and_then(|t| t.read(cx).conn.clone());
+            let conn = remembered.or(current.filter(|c| Some(c.project_key) == project));
+            (project, conn)
+        };
+        let tab = match self.reuse_empty_tab(cx) {
             Some(t) => t,
-            None => self.new_tab(conn, window, cx),
+            None => self.new_tab(None, project, window, cx),
         };
-        tab.update(cx, |t, cx| t.load_file(path, &text, window, cx));
+        tab.update(cx, |t, cx| t.load_file(path, &text, conn, window, cx));
         self.focus_editor(window, cx);
         cx.notify();
     }
 
+    fn project_scripts_dir(&self, key: Option<u32>) -> Option<PathBuf> {
+        let ps = self.projects.borrow();
+        key.and_then(|k| crate::ui::project(&ps, k)).or(ps.first()).map(Project::scripts_dir)
+    }
+
     fn save(&mut self, save_as: bool, window: &mut Window, cx: &mut Context<Self>) {
         let Some(tab) = self.active_tab().cloned() else { return };
-        let (path, text, title) = {
+        let (path, text, title, project, save_dir) = {
             let t = tab.read(cx);
-            (t.path.clone(), t.text(cx), t.title())
+            (t.path.clone(), t.text(cx), t.title(), t.project, t.save_dir.clone())
         };
         if let (Some(p), false) = (path.clone(), save_as) {
             match std::fs::write(&p, text) {
                 Ok(()) => tab.update(cx, |t, cx| t.mark_saved(p, cx)),
-                Err(e) => window.push_notification(Notification::error(format!("Save failed: {e}")), cx),
+                Err(e) => error(window, cx, format!("Save failed: {e}")),
             }
             return;
         }
-        let dir = path.as_ref().and_then(|p| p.parent().map(|d| d.to_path_buf())).or(self.settings.scripts_dir.clone());
+        let dir = path
+            .as_ref()
+            .and_then(|p| p.parent().map(Path::to_path_buf))
+            .or(save_dir)
+            .or_else(|| self.project_scripts_dir(project));
         let name = if title.ends_with(".sql") { title.to_string() } else { format!("{title}.sql") };
         cx.spawn_in(window, async move |this, cx| {
             let mut d = rfd::AsyncFileDialog::new().set_file_name(&name).add_filter("SQL", &["sql"]);
             if let Some(dir) = dir {
+                let _ = std::fs::create_dir_all(&dir);
                 d = d.set_directory(dir);
             }
             let Some(f) = d.save_file().await else { return };
@@ -378,17 +702,16 @@ impl Workbench {
             let _ = this.update_in(cx, |wb, window, cx| match std::fs::write(&p, &text) {
                 Ok(()) => {
                     tab.update(cx, |t, cx| t.mark_saved(p, cx));
-                    let dir = wb.settings.scripts_dir.clone();
-                    wb.sidebar.update(cx, |s, cx| s.set_scripts_dir(dir, cx));
+                    wb.sidebar.update(cx, |s, cx| s.refresh(cx));
                 }
-                Err(e) => window.push_notification(Notification::error(format!("Save failed: {e}")), cx),
+                Err(e) => error(window, cx, format!("Save failed: {e}")),
             });
         })
         .detach();
     }
 
     fn open_dialog_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let dir = self.settings.scripts_dir.clone();
+        let dir = self.project_scripts_dir(self.current_project(cx));
         cx.spawn_in(window, async move |this, cx| {
             let mut d = rfd::AsyncFileDialog::new().add_filter("SQL", &["sql"]).add_filter("All files", &["*"]);
             if let Some(dir) = dir {
@@ -424,8 +747,9 @@ impl Workbench {
         } else if a.is::<ToggleAutocommit>() {
             self.with_active(cx, |t, _| t.toggle_autocommit());
         } else if a.is::<NewTab>() {
-            let conn = self.active_tab().and_then(|t| t.read(cx).conn.clone());
-            self.new_tab(conn, window, cx);
+            let (conn, project) =
+                self.active_tab().map(|t| (t.read(cx).conn.clone(), t.read(cx).project)).unwrap_or_default();
+            self.new_tab(conn, project, window, cx);
         } else if a.is::<CloseTab>() {
             self.close_tab(self.active, window, cx);
         } else if a.is::<NextTab>() {
@@ -449,7 +773,11 @@ impl Workbench {
                 t.update(cx, |t, cx| t.export_csv(window, cx));
             }
         } else if a.is::<NewConnection>() {
-            self.edit_connection(None, window, cx);
+            self.new_connection(window, cx);
+        } else if a.is::<NewProject>() {
+            self.new_project(window, cx);
+        } else if a.is::<OpenProject>() {
+            self.pick_project(window, cx);
         } else if a.is::<ToggleTheme>() {
             self.toggle_theme(window, cx);
         } else if a.is::<FocusEditor>() {
@@ -572,7 +900,7 @@ impl Workbench {
                         .items_center()
                         .child(div().size(px(8.)).rounded_full().bg(color))
                         .child(div().text_color(theme.foreground).child(c.name.clone()))
-                        .child(format!("{}@{}:{}/{}", c.user, c.host, c.port, c.database))
+                        .child(format!("{}:{}/{}", c.host, c.port, c.database))
                         .child(div().text_color(state.1).child(state.0))
                         .into_any_element()
                 }
@@ -619,6 +947,10 @@ impl Render for Workbench {
         let theme = cx.theme().clone();
         let active = self.active_tab().cloned();
         let title_conn = active.as_ref().and_then(|t| t.read(cx).conn.clone());
+        let title_project = active
+            .as_ref()
+            .and_then(|t| t.read(cx).project)
+            .and_then(|k| crate::ui::project(&self.projects.borrow(), k).map(|p| p.name().to_string()));
         let root = v_flex()
             .id("workbench")
             .key_context("Workbench")
@@ -628,7 +960,8 @@ impl Render for Workbench {
             .text_color(theme.foreground);
         let root = bind!(
             root, cx, RunStatement, RunScript, CancelQuery, Commit, Rollback, ToggleAutocommit, NewTab, CloseTab,
-            NextTab, PrevTab, SaveFile, SaveFileAs, OpenFile, ExportCsv, NewConnection, CommandPalette, FocusEditor,
+            NextTab, PrevTab, SaveFile, SaveFileAs, OpenFile, ExportCsv, NewConnection, NewProject, OpenProject,
+            CommandPalette, FocusEditor,
             ToggleTheme
         );
         root.child(
@@ -638,9 +971,13 @@ impl Render for Workbench {
                     .items_center()
                     .child(Icon::new(Lucide::Database).small().text_color(theme.primary))
                     .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child("good-query"))
+                    .when_some(title_project, |el, p| {
+                        el.child(div().text_sm().text_color(theme.muted_foreground).child("—"))
+                            .child(div().text_sm().text_color(theme.muted_foreground).child(p))
+                    })
                     .when_some(title_conn, |el, c| {
                         let color = conn_color(&c, cx);
-                        el.child(div().text_sm().text_color(theme.muted_foreground).child("—"))
+                        el.child(div().text_sm().text_color(theme.muted_foreground).child("/"))
                             .child(div().text_sm().text_color(color).font_weight(FontWeight::MEDIUM).child(c.name))
                     }),
             ),

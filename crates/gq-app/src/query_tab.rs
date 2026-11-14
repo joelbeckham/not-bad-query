@@ -22,7 +22,7 @@ use gq_sql::{SplitOptions, split, statement_at};
 
 use crate::complete::{Catalogs, SqlCompleter};
 use crate::grid::ResultGrid;
-use crate::ui::{conn_color, fmt_count, fmt_elapsed};
+use crate::ui::{Projects, conn_color, fmt_count, fmt_elapsed};
 
 pub enum Status {
     Idle,
@@ -37,7 +37,11 @@ pub struct QueryTab {
     pub engine_tab: TabId,
     engine: Arc<Engine>,
     pub conn: Option<Connection>,
-    conn_list: Rc<RefCell<Vec<Connection>>>,
+    projects: Projects,
+    /// The project this tab belongs to (its script and connection both come from it).
+    pub project: Option<u32>,
+    /// Where Save first suggests putting an untitled script.
+    pub save_dir: Option<PathBuf>,
     completer_conn: Rc<RefCell<Option<String>>>,
     pub editor: Entity<EditorState>,
     pub grid: Entity<TableState<ResultGrid>>,
@@ -62,7 +66,7 @@ impl QueryTab {
     pub fn new(
         engine: Arc<Engine>,
         catalogs: Catalogs,
-        conn_list: Rc<RefCell<Vec<Connection>>>,
+        projects: Projects,
         untitled: usize,
         settings: &Settings,
         window: &mut Window,
@@ -87,7 +91,9 @@ impl QueryTab {
             engine_tab,
             engine,
             conn: None,
-            conn_list,
+            projects,
+            project: None,
+            save_dir: None,
             completer_conn,
             editor,
             grid,
@@ -126,10 +132,41 @@ impl QueryTab {
     pub fn set_connection(&mut self, conn: Option<Connection>, cx: &mut Context<Self>) {
         let params = conn.as_ref().map(crate::ui::params_for);
         let autocommit = conn.as_ref().map(|c| c.autocommit).unwrap_or(true);
-        *self.completer_conn.borrow_mut() = conn.as_ref().map(|c| c.id.clone());
+        *self.completer_conn.borrow_mut() = conn.as_ref().map(|c| c.key());
         self.engine.set_connection(self.engine_tab, params, autocommit);
+        if let Some(c) = &conn {
+            self.project = Some(c.project_key);
+        }
         self.conn = conn;
         self.conn_state = ConnState::Disconnected;
+        self.remember_connection();
+        cx.notify();
+    }
+
+    /// Record this script's connection in the project's local state, so
+    /// reopening the script reconnects to the same database.
+    fn remember_connection(&self) {
+        let (Some(path), Some(c)) = (&self.path, &self.conn) else { return };
+        let mut ps = self.projects.borrow_mut();
+        if let Some(p) = ps.iter_mut().find(|p| p.key == c.project_key) {
+            if let Err(e) = p.set_script_connection(path, Some(&c.id)) {
+                tracing::warn!("remember script connection: {e}");
+            }
+        }
+    }
+
+    /// The tab's file moved to `path` (Save As, or opened into this tab):
+    /// adopt that file's project, dropping a connection from another one.
+    pub fn set_path(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        let project = crate::ui::project_for_path(&self.projects.borrow(), &path);
+        self.path = Some(path);
+        if project.is_some() || self.conn.is_none() {
+            self.project = project;
+        }
+        if self.conn.as_ref().is_some_and(|c| Some(c.project_key) != self.project) {
+            self.set_connection(None, cx);
+        }
+        self.remember_connection();
         cx.notify();
     }
 
@@ -218,12 +255,18 @@ impl QueryTab {
         let opts = self.csv.clone();
         let engine = self.engine.clone();
         let tab = self.engine_tab;
-        let name = format!("{}.csv", self.title().trim_end_matches(".sql"));
+        let name = crate::ui::export_file_name(&self.title(), chrono::Local::now().naive_local());
+        // Default to the project's exports/ folder (git-ignored).
+        let dir = self.project.and_then(|k| crate::ui::project(&self.projects.borrow(), k).map(|p| p.exports_dir()));
+        if let Some(d) = &dir {
+            let _ = std::fs::create_dir_all(d);
+        }
         cx.spawn(async move |this, cx| {
-            let Some(file) = rfd::AsyncFileDialog::new().set_file_name(&name).add_filter("CSV", &["csv"]).save_file().await
-            else {
-                return;
-            };
+            let mut d = rfd::AsyncFileDialog::new().set_file_name(&name).add_filter("CSV", &["csv"]);
+            if let Some(dir) = dir {
+                d = d.set_directory(dir);
+            }
+            let Some(file) = d.save_file().await else { return };
             let path = file.path().to_path_buf();
             let _ = this.update(cx, |t, cx| {
                 t.export = Some((path.clone(), 0, None));
@@ -234,10 +277,23 @@ impl QueryTab {
         .detach();
     }
 
-    pub fn load_file(&mut self, path: PathBuf, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+    /// Show a file in this tab, on `conn` (which the caller picked from the
+    /// file's project).
+    pub fn load_file(
+        &mut self,
+        path: PathBuf,
+        text: &str,
+        conn: Option<Connection>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.editor.update(cx, |e, cx| e.set_value(text, window, cx));
+        self.project = crate::ui::project_for_path(&self.projects.borrow(), &path);
         self.path = Some(path);
         self.dirty = false;
+        if self.conn.as_ref().map(|c| c.key()) != conn.as_ref().map(|c| c.key()) {
+            self.set_connection(conn, cx);
+        }
         cx.notify();
     }
 
@@ -246,8 +302,10 @@ impl QueryTab {
     }
 
     pub fn mark_saved(&mut self, path: PathBuf, cx: &mut Context<Self>) {
-        self.path = Some(path);
         self.dirty = false;
+        if self.path.as_ref() != Some(&path) {
+            self.set_path(path, cx);
+        }
         cx.notify();
     }
 
@@ -376,9 +434,10 @@ impl QueryTab {
             .border_b_1()
             .border_color(theme.border)
             .child({
-                let list = self.conn_list.clone();
+                let projects = self.projects.clone();
+                let only = self.project;
                 let me = cx.entity();
-                let current = self.conn.as_ref().map(|c| c.id.clone());
+                let current = self.conn.as_ref().map(|c| c.key());
                 Button::new("conn-chip")
                     .small()
                     .outline()
@@ -386,15 +445,33 @@ impl QueryTab {
                     .label(conn_label)
                     .tooltip("Connection for this tab")
                     .dropdown_menu(move |mut menu, window, _| {
-                        for c in list.borrow().iter() {
-                            let c2 = c.clone();
-                            menu = menu.item(
-                                PopupMenuItem::new(c.name.clone())
-                                    .checked(current.as_deref() == Some(c.id.as_str()))
-                                    .on_click(window.listener_for(&me, move |t: &mut QueryTab, _: &ClickEvent, _, cx| {
-                                        t.set_connection(Some(c2.clone()), cx)
-                                    })),
-                            );
+                        // A tab's script and connection come from one project:
+                        // once the tab has a project, only its connections are offered.
+                        let ps = projects.borrow();
+                        let shown: Vec<_> = ps.iter().filter(|p| only.is_none_or(|k| k == p.key)).collect();
+                        if shown.iter().all(|p| p.connections.connections.is_empty()) {
+                            return menu.label("No connections in this project yet");
+                        }
+                        for (i, p) in shown.iter().enumerate() {
+                            if shown.len() > 1 {
+                                if i > 0 {
+                                    menu = menu.separator();
+                                }
+                                menu = menu.label(p.name().to_string());
+                            }
+                            let mut conns = p.connections.connections.clone();
+                            conns.sort_by_key(|c| (c.folder.clone().unwrap_or_default().to_lowercase(), c.name.to_lowercase()));
+                            for c in conns {
+                                let label = match &c.folder {
+                                    Some(f) => format!("{f} / {}", c.name),
+                                    None => c.name.clone(),
+                                };
+                                let checked = current.as_deref() == Some(c.key().as_str());
+                                menu = menu.item(PopupMenuItem::new(label).checked(checked).on_click(window.listener_for(
+                                    &me,
+                                    move |t: &mut QueryTab, _: &ClickEvent, _, cx| t.set_connection(Some(c.clone()), cx),
+                                )));
+                            }
                         }
                         menu
                     })

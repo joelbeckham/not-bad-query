@@ -18,21 +18,22 @@ struct Choices {
     ssl: SslMode,
     color: Option<String>,
     autocommit: bool,
-    save_password: bool,
 }
 
-/// Open the dialog. `on_save(connection, new_password)`; `new_password` is
+/// Open the dialog. `on_save(connection, user, new_password)`; `new_password` is
 /// `None` when the field was left empty while editing (keep the stored one).
 pub fn open(
     existing: Option<Connection>,
+    folder: Option<String>,
+    user: String,
     window: &mut Window,
     cx: &mut App,
-    on_save: impl Fn(Connection, Option<String>, &mut Window, &mut App) + 'static,
+    on_save: impl Fn(Connection, String, Option<String>, &mut Window, &mut App) + 'static,
 ) {
     let editing = existing.is_some();
     let base = existing.unwrap_or_else(|| {
         let mut c = Connection::new("", DbKind::Postgres);
-        c.user = "postgres".into();
+        c.folder = folder;
         c
     });
     let input = |v: String, ph: &'static str, window: &mut Window, cx: &mut App| {
@@ -43,7 +44,7 @@ pub fn open(
     let host = input(base.host.clone(), "localhost", window, cx);
     let port = input(base.port.to_string(), "5432", window, cx);
     let database = input(base.database.clone(), "postgres", window, cx);
-    let user = input(base.user.clone(), "postgres", window, cx);
+    let user = input(if editing { user } else { "postgres".into() }, "postgres", window, cx);
     let password = cx.new(|cx| {
         InputState::new(window, cx)
             .masked(true)
@@ -54,7 +55,6 @@ pub fn open(
         ssl: base.ssl,
         color: base.color.clone(),
         autocommit: base.autocommit,
-        save_password: base.save_password,
     }));
     let on_save = Rc::new(on_save);
     let first = std::cell::Cell::new(true);
@@ -152,16 +152,13 @@ pub fn open(
                                 window.refresh();
                             },
                         )
-                    })
-                    .child({
-                        let choices = choices.clone();
-                        Switch::new("savepw").checked(ch.save_password).label("Save password").on_click(
-                            move |v: &bool, window, _| {
-                                choices.borrow_mut().save_password = *v;
-                                window.refresh();
-                            },
-                        )
                     }),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child("User and password are kept in your OS credential store, never in the project folder."),
             );
         drop(ch);
         let (name, folder, host, port, database, user, password, choices, base, on_save) = (
@@ -202,15 +199,14 @@ pub fn open(
                 c.folder = Some(v(&folder)).filter(|f| !f.is_empty());
                 c.host = v(&host);
                 c.database = v(&database);
-                c.user = v(&user);
+                let user = v(&user);
                 c.kind = ch.kind;
                 c.ssl = ch.ssl;
                 c.color = ch.color.clone();
                 c.autocommit = ch.autocommit;
-                c.save_password = ch.save_password;
                 let pw = password.read(cx).value().to_string();
                 let pw = (!pw.is_empty()).then_some(pw);
-                on_save(c, pw, window, cx);
+                on_save(c, user, pw, window, cx);
                 true
             })
     });

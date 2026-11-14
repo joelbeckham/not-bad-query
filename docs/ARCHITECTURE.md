@@ -69,6 +69,28 @@ intervals, arrays, ranges, records, enums, domains, inet, ...) to text identical
 server's output function — checked by an oracle test against `format('%s', x)`.
 Ints/floats/bools/bytea stay typed in Arrow; everything else is stored as display text.
 
+## Projects
+
+A project is a folder, often a subfolder of a git repo (`repo/queries/`). The layout is fixed:
+
+```
+good-query.toml                    id + name (marks the folder as a project)
+connections/<folder>/<Name>.toml   one file per connection; name and folder come from the path
+scripts/...                        SQL files
+exports/                           CSV export default (git-ignored)
+.good-query/local.toml             per-user state, e.g. script -> last connection (git-ignored)
+```
+
+- Connection files hold no user or password. Credentials are in the OS credential store under
+  `<project id>/<connection id>`. Ids are stable across renames; copied or hand-written files
+  without a unique id get one written back on load.
+- Several projects can be open in one window (`workspace.toml` in the app config dir lists them).
+  A tab belongs to one project: its script and its connection both come from it.
+- `Project` keys (`u32`) are per process, and `Connection::key()` is `<project key>:<id>`. Engine
+  caches, catalogs and tree ids use that key, so two copies of a project never collide.
+- A `notify` watcher records changed paths; the workbench polls it, reloads projects whose
+  `connections/` or `scripts/` changed, and reconnects tabs whose connection settings changed.
+
 ## Testing
 
 | Layer | How |

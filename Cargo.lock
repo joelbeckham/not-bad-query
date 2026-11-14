@@ -2910,6 +2910,7 @@ name = "gq-app"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "gpui-kit",
  "gq-core",
  "gq-driver",
@@ -2917,6 +2918,7 @@ dependencies = [
  "gq-sql",
  "lsp-types",
  "rfd",
+ "tempfile",
  "tracing",
 ]
 
@@ -2927,6 +2929,7 @@ dependencies = [
  "directories",
  "gq-driver",
  "keyring",
+ "notify",
  "serde",
  "tempfile",
  "thiserror 2.0.21",
