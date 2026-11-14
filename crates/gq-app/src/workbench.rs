@@ -155,9 +155,13 @@ impl Workbench {
         };
         let first = wb.projects.borrow().first().and_then(|p| p.connections.connections.first().cloned());
         wb.new_tab(first, None, window, cx);
-        for e in problems {
-            error(window, cx, e);
-        }
+        // The component Root is attached by open_window only after this builder
+        // returns. Notifications need its WindowState, even though init ran.
+        window.defer(cx, move |window, cx| {
+            for problem in problems {
+                error(window, cx, problem);
+            }
+        });
         let owner = cx.weak_entity();
         window.on_window_should_close(cx, move |window, cx| {
             owner.update(cx, |wb, cx| wb.request_close(window, cx)).unwrap_or(true)
