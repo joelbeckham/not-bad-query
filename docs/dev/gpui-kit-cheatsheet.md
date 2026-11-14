@@ -781,7 +781,7 @@ Usage, from examples/editor/src/main.rs:1177-1187 and examples/dialog_overlay/sr
 
 ```rust
 v_flex().size_full()
-    .child(TitleBar::new().child("Good Query"))
+    .child(TitleBar::new().child("Not Bad Query"))
     .child(/* splits */)
     .child(StatusBar::new().left(format!("Ln {}, Col {}", pos.line + 1, pos.character + 1)).right(format!("{:.1}s", elapsed)))
 ```

@@ -1,4 +1,4 @@
-# Click inside the good-query window at window-relative pixel coordinates
+# Click inside the not-bad-query window at window-relative pixel coordinates
 # (the same coordinates as in dev/screenshot.ps1 output).
 #   powershell -File dev/click.ps1 -X 60 -Y 95 [-Double] [-Right]
 param(
@@ -6,7 +6,7 @@ param(
     [Parameter(Mandatory = $true)][int]$Y,
     [switch]$Double,
     [switch]$Right,
-    [string]$ProcessName = "good-query"
+    [string]$ProcessName = "not-bad-query"
 )
 Add-Type @"
 using System;

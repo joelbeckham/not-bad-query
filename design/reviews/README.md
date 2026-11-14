@@ -4,6 +4,10 @@ Screenshots captured from the debug Windows application with an isolated config
 and the local sample PostgreSQL project. Input messages targeted the preview's
 exact process/window; no global keyboard or mouse input was used.
 
+All five images were recaptured after the `not-bad-query` rename. The native
+window title, title bar, and quit confirmation show the current application name.
+The renamed app passed all 97 workspace tests and all five native startup cases.
+
 - `results-before.png`: a real 10,000-row PostgreSQL execution paused on demand;
   background result previews render IDs, text, numeric and timestamp values.
 - `connection-before.png`: new connections default to Verify full with public CA import.
@@ -18,7 +22,8 @@ exports and script-save conflicts.
 
 ## Claude review status: pending access
 
-The T3 Claude review delegate failed before inspecting the screenshots:
+The T3 Claude review delegate, including the fresh rename review attempt, failed
+before inspecting the screenshots:
 
 > Your organization has disabled Claude subscription access for Claude Code · Use an Anthropic API key instead, or ask your admin to enable access
 

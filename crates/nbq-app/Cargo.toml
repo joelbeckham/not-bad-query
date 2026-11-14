@@ -1,0 +1,28 @@
+[package]
+name = "nbq-app"
+description = "not-bad-query desktop UI (GPUI)"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "not-bad-query"
+path = "src/main.rs"
+
+[dependencies]
+gpui-kit = { version = "0.9.1", features = ["tree-sitter-sql"] }
+nbq-core.workspace = true
+nbq-driver.workspace = true
+nbq-engine.workspace = true
+nbq-sql.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+lsp-types = { version = "0.97", features = ["proposed"] }
+rfd = "0.18"
+chrono = { workspace = true, features = ["clock"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+arrow-array.workspace = true
+arrow-schema.workspace = true

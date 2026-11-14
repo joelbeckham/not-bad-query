@@ -1,8 +1,8 @@
-# Capture the good-query window to a PNG (for visual checks during development).
-#   powershell -File dev/screenshot.ps1 -Out shot.png [-ProcessName good-query]
+# Capture the not-bad-query window to a PNG (for visual checks during development).
+#   powershell -File dev/screenshot.ps1 -Out shot.png [-ProcessName not-bad-query]
 param(
     [Parameter(Mandatory = $true)][string]$Out,
-    [string]$ProcessName = "good-query",
+    [string]$ProcessName = "not-bad-query",
     [int]$TargetProcessId
 )
 

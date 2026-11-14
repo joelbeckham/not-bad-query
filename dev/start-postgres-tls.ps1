@@ -6,7 +6,7 @@ New-Item -ItemType Directory -Force -Path $fixturePath | Out-Null
 $openssl = 'C:\Program Files\Git\usr\bin\openssl.exe'
 if (-not (Test-Path -LiteralPath $openssl)) { $openssl = (Get-Command openssl).Source }
 $ErrorActionPreference = 'Continue'
-& $openssl req -x509 -nodes -newkey rsa:2048 -days 2 -subj '/CN=Good Query Test CA' -addext 'basicConstraints=critical,CA:TRUE' -keyout "$fixturePath/ca.key" -out "$fixturePath/ca.pem" 2>$null
+& $openssl req -x509 -nodes -newkey rsa:2048 -days 2 -subj '/CN=Not Bad Query Test CA' -addext 'basicConstraints=critical,CA:TRUE' -keyout "$fixturePath/ca.key" -out "$fixturePath/ca.pem" 2>$null
 if ($LASTEXITCODE -ne 0) { throw 'CA generation failed' }
 & $openssl req -nodes -newkey rsa:2048 -subj '/CN=localhost' -keyout "$fixturePath/server.key" -out "$fixturePath/server.csr" 2>$null
 if ($LASTEXITCODE -ne 0) { throw 'Server key generation failed' }

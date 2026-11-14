@@ -1,6 +1,6 @@
 # Local databases for tests and manual testing.
 #   docker compose -f dev/docker-compose.yml up -d --wait
-name: good-query-dev
+name: not-bad-query-dev
 services:
   postgres:
     image: postgres:17-alpine

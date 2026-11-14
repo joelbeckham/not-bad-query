@@ -1,8 +1,8 @@
-# Send keystrokes to the good-query window (SendKeys syntax: ^ = Ctrl, % = Alt, + = Shift, {ENTER}).
+# Send keystrokes to the not-bad-query window (SendKeys syntax: ^ = Ctrl, % = Alt, + = Shift, {ENTER}).
 #   powershell -File dev/keys.ps1 -Keys "select 1^{ENTER}"
 param(
     [Parameter(Mandatory = $true)][string]$Keys,
-    [string]$ProcessName = "good-query",
+    [string]$ProcessName = "not-bad-query",
     [int]$DelayMs = 300
 )
 Add-Type -AssemblyName System.Windows.Forms

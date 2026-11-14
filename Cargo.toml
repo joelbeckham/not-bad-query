@@ -9,12 +9,12 @@ license = "MIT"
 publish = false
 
 [workspace.dependencies]
-gq-sql = { path = "crates/gq-sql" }
-gq-driver = { path = "crates/gq-driver" }
-gq-results = { path = "crates/gq-results" }
-gq-engine = { path = "crates/gq-engine" }
-gq-core = { path = "crates/gq-core" }
-gq-testkit = { path = "crates/gq-testkit" }
+nbq-sql = { path = "crates/nbq-sql" }
+nbq-driver = { path = "crates/nbq-driver" }
+nbq-results = { path = "crates/nbq-results" }
+nbq-engine = { path = "crates/nbq-engine" }
+nbq-core = { path = "crates/nbq-core" }
+nbq-testkit = { path = "crates/nbq-testkit" }
 
 anyhow = "1"
 thiserror = "2"

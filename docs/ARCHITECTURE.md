@@ -7,8 +7,14 @@ not grow memory, and a UI action must never wait on the network.
 
 ## Shape
 
+The application/executable is `not-bad-query`; Rust crates and internal namespaces
+use `nbq-*` / `nbq_*`. Development environment variables use the `NBQ_` prefix.
+User settings live in the OS application-data directory for `not-bad-query`, and
+credentials use the `not-bad-query` OS credential-store service. Projects are
+identified by `not-bad-query.toml`, with local state under `.not-bad-query/`.
+
 ```
-gq-app (GPUI views)  ──commands──▶  gq-engine (tokio runtime)
+nbq-app (GPUI views)  ──commands──▶  nbq-engine (tokio runtime)
         ▲                               │  one actor per tab: owns its DB session
         └────────── Event channel ──────┘  one fetch task per result: stream → spool
         │
@@ -40,7 +46,7 @@ The PostgreSQL driver targets 4 MiB batches, permits a final larger row (up to 1
 and rejects values over 8 MiB or results wider than 1,024 columns. The PostgreSQL
 protocol necessarily receives an individual row before its value limits can be checked.
 
-Measured (`gq-results/tests/memory.rs`): 289 MiB of row data → 33 MiB on disk, 26 MiB peak tracked heap
+Measured (`nbq-results/tests/memory.rs`): 289 MiB of row data → 33 MiB on disk, 26 MiB peak tracked heap
 while scrolling randomly and exporting everything.
 
 ## Fetch policy: pause on the server
@@ -49,7 +55,7 @@ A result opens with `initial_rows` (500) fetched. After that the fetch task stop
 polling the driver stream until the grid asks for more (`ensure_rows` + lookahead).
 For Postgres an unpolled `tokio_postgres::RowStream` makes the connection stop reading
 the socket, so the backend blocks in `ClientWrite`: the result is paused **on the server**
-with no cursor and no transaction (verified in `gq-driver/tests/pg.rs`).
+with no cursor and no transaction (verified in `nbq-driver/tests/pg.rs`).
 
 * Statements that write (incl. `UPDATE ... RETURNING`) and all but the last statement
   of a script are always drained to completion.
@@ -63,7 +69,7 @@ with no cursor and no transaction (verified in `gq-driver/tests/pg.rs`).
 
 * Auto-commit is the per-connection default, toggleable per tab.
 * Manual mode issues `BEGIN` lazily before the first statement. On Postgres every
-  statement in a transaction is wrapped in `SAVEPOINT gq_sp`: an error rolls back to the
+  statement in a transaction is wrapped in `SAVEPOINT nbq_sp`: an error rolls back to the
   savepoint so the transaction survives (no "current transaction is aborted"), and a
   paused result can be cancelled without losing pending changes.
 * Redshift has no savepoints: there, closing a paused result inside a transaction drains
@@ -107,11 +113,11 @@ Ints/floats/bools/bytea stay typed in Arrow; everything else is stored as displa
 A project is a folder, often a subfolder of a git repo (`repo/queries/`). The layout is fixed:
 
 ```
-good-query.toml                    id + name (marks the folder as a project)
+not-bad-query.toml                    id + name (marks the folder as a project)
 connections/<folder>/<Name>.toml   one file per connection; name and folder come from the path
 scripts/...                        SQL files
 exports/                           CSV export default (git-ignored)
-.good-query/local.toml             per-user state, e.g. script -> last connection (git-ignored)
+.not-bad-query/local.toml             per-user state, e.g. script -> last connection (git-ignored)
 ```
 
 - Connection files hold no user or password. Credentials are in the OS credential store under
@@ -128,8 +134,8 @@ exports/                           CSV export default (git-ignored)
 
 | Layer | How |
 |---|---|
-| `gq-sql` | table tests + proptests (never panics, ranges valid) |
-| `gq-driver` | real Postgres: type rendering oracle, pause (`ClientWrite`), cancel, errors |
-| `gq-results` | windows across batch boundaries, live export, CSV quoting, bounded memory |
-| `gq-engine` | headless E2E: scroll/fetch, export, cancel, txn commit/rollback, savepoint recovery, reconnect |
-| `gq-app` | Helper/completion unit tests; native screenshots reviewed by Claude via `AGENTS.md` |
+| `nbq-sql` | table tests + proptests (never panics, ranges valid) |
+| `nbq-driver` | real Postgres: type rendering oracle, pause (`ClientWrite`), cancel, errors |
+| `nbq-results` | windows across batch boundaries, live export, CSV quoting, bounded memory |
+| `nbq-engine` | headless E2E: scroll/fetch, export, cancel, txn commit/rollback, savepoint recovery, reconnect |
+| `nbq-app` | Helper/completion unit tests; native screenshots reviewed by Claude via `AGENTS.md` |

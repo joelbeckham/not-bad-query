@@ -18,7 +18,7 @@ public static class AppInput {
 "@
 [AppInput]::SetProcessDPIAware() | Out-Null
 $appProcess = Get-Process -Id $TargetProcessId -ErrorAction Stop
-if ($appProcess.ProcessName -ne 'good-query' -or $appProcess.MainWindowHandle -eq 0) { throw 'No matching preview window' }
+if ($appProcess.ProcessName -ne 'not-bad-query' -or $appProcess.MainWindowHandle -eq 0) { throw 'No matching preview window' }
 $handle = $appProcess.MainWindowHandle
 if ($X -ge 0 -and $Y -ge 0) {
     $point = [IntPtr](($Y -shl 16) -bor ($X -band 0xffff))

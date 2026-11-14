@@ -1,5 +1,5 @@
 # Exercise real native startup with broken configuration, without touching user settings.
-param([string]$Executable = 'target/debug/good-query.exe')
+param([string]$Executable = 'target/debug/not-bad-query.exe')
 $ErrorActionPreference = 'Stop'
 $binary = (Resolve-Path -LiteralPath $Executable).Path
 $fixtureRoot = Join-Path (Resolve-Path .).Path ('target/startup-smoke-' + [Guid]::NewGuid().ToString('N'))
@@ -28,7 +28,7 @@ public static class StartupSmoke {
     }
 }
 '@
-$originalConfig = $env:GQ_CONFIG_DIR
+$originalConfig = $env:NBQ_CONFIG_DIR
 try {
     foreach ($case in @('clean', 'missing-project', 'bad-settings', 'bad-workspace', 'bad-connection')) {
         $config = Join-Path $fixtureRoot $case
@@ -40,12 +40,12 @@ try {
             'bad-connection' {
                 $project = Join-Path $config 'project'
                 New-Item -ItemType Directory -Path (Join-Path $project 'connections') | Out-Null
-                [IO.File]::WriteAllText((Join-Path $project 'good-query.toml'), "id = 'startup-test'`nname = 'Startup test'", $utf8)
+                [IO.File]::WriteAllText((Join-Path $project 'not-bad-query.toml'), "id = 'startup-test'`nname = 'Startup test'", $utf8)
                 [IO.File]::WriteAllText((Join-Path $project 'connections/bad.toml'), 'port = [', $utf8)
                 [IO.File]::WriteAllText((Join-Path $config 'workspace.toml'), ("open = ['" + $project + "']"), $utf8)
             }
         }
-        $env:GQ_CONFIG_DIR = $config
+        $env:NBQ_CONFIG_DIR = $config
         $stderr = Join-Path $config 'stderr.log'
         $process = Start-Process -FilePath $binary -WorkingDirectory (Get-Location).Path -WindowStyle Hidden -RedirectStandardError $stderr -RedirectStandardOutput (Join-Path $config 'stdout.log') -PassThru
         # Cache the native handle before exit; Windows PowerShell otherwise can
@@ -64,5 +64,5 @@ try {
         }
     }
 } finally {
-    $env:GQ_CONFIG_DIR = $originalConfig
+    $env:NBQ_CONFIG_DIR = $originalConfig
 }
