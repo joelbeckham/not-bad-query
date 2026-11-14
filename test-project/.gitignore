@@ -1,0 +1,3 @@
+# good-query: per-user state and exports stay out of git
+.good-query/
+exports/
