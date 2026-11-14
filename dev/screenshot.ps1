@@ -2,7 +2,8 @@
 #   powershell -File dev/screenshot.ps1 -Out shot.png [-ProcessName good-query]
 param(
     [Parameter(Mandatory = $true)][string]$Out,
-    [string]$ProcessName = "good-query"
+    [string]$ProcessName = "good-query",
+    [int]$TargetProcessId
 )
 
 Add-Type -AssemblyName System.Drawing
@@ -18,7 +19,10 @@ public static class Win {
 "@
 [Win]::SetProcessDPIAware() | Out-Null
 
-$p = Get-Process -Name $ProcessName -ErrorAction Stop | Where-Object { $_.MainWindowHandle -ne 0 } | Select-Object -First 1
+$p = if ($TargetProcessId) { Get-Process -Id $TargetProcessId -ErrorAction Stop } else {
+    Get-Process -Name $ProcessName -ErrorAction Stop | Where-Object { $_.MainWindowHandle -ne 0 } | Select-Object -First 1
+}
+if ($p.ProcessName -ne $ProcessName -or $p.MainWindowHandle -eq 0) { throw "No matching app window" }
 if (-not $p) { throw "no window for process $ProcessName" }
 $h = $p.MainWindowHandle
 $r = New-Object Win+RECT
