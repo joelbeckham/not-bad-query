@@ -13,6 +13,12 @@ User settings live in the OS application-data directory for `not-bad-query`, and
 credentials use the `not-bad-query` OS credential-store service. Projects are
 identified by `not-bad-query.toml`, with local state under `.not-bad-query/`.
 
+The application icon is an adaptation of Lucide's ISC-licensed `database-zap`.
+Windows builds embed the multi-size ICO as resource 1 (loaded by GPUI for the
+native window class and taskbar) and its license as resource 2. The custom title
+bar renders the same design from embedded PNG bytes. Assets and regeneration
+instructions are in `crates/nbq-app/assets/`.
+
 ```
 nbq-app (GPUI views)  ──commands──▶  nbq-engine (tokio runtime)
         ▲                               │  one actor per tab: owns its DB session

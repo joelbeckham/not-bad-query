@@ -1060,7 +1060,7 @@ impl Render for Workbench {
                 h_flex()
                     .gap_2()
                     .items_center()
-                    .child(Icon::new(Lucide::Database).small().text_color(theme.primary))
+                    .child(img(crate::app_icon::image()).size(px(20.)).flex_shrink_0())
                     .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child("not-bad-query"))
                     .when_some(title_project, |el, p| {
                         el.child(div().text_sm().text_color(theme.muted_foreground).child("—"))

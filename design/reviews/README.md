@@ -20,9 +20,22 @@ preview process. Automated checks additionally cover server cancellation on tab
 close, transaction recovery, TLS hostname/chain checks, quota reclamation, safe
 exports and script-save conflicts.
 
+## Application icon
+
+- `icon-workbench.png`: the shared database/bolt design in the native title bar.
+- `windows-app-icon.png`: the actual 40px Windows window-class icon read from the
+  preview process. The executable's icon group resource 1 and embedded upstream
+  license resource 2 were verified directly.
+- `taskbar-app-icon.png`: the actual Windows taskbar button, cropped to this app
+  using its UI Automation bounds. The custom icon is visible in the taskbar.
+
+The debug application was rebuilt; all six app tests and five native startup
+regressions pass with the icon resources. Source and license provenance, DPI sizes,
+and regeneration instructions are in `../../crates/nbq-app/assets/README.md`.
+
 ## Claude review status: pending access
 
-The T3 Claude review delegate, including the fresh rename review attempt, failed
+The T3 Claude review delegate, including fresh rename and application-icon reviews, failed
 before inspecting the screenshots:
 
 > Your organization has disabled Claude subscription access for Claude Code · Use an Anthropic API key instead, or ask your admin to enable access

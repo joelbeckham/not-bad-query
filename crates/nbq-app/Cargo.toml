@@ -22,7 +22,11 @@ lsp-types = { version = "0.97", features = ["proposed"] }
 rfd = "0.18"
 chrono = { workspace = true, features = ["clock"] }
 
+[build-dependencies]
+embed-resource = "3"
+
 [dev-dependencies]
 tempfile.workspace = true
 arrow-array.workspace = true
 arrow-schema.workspace = true
+resvg = { version = "0.46", default-features = false }
