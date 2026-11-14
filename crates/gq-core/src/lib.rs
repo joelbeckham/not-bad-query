@@ -9,6 +9,7 @@
 //! credential store ([`secrets`]).
 
 mod color;
+pub mod files;
 pub mod project;
 mod tree;
 pub mod watch;
@@ -59,6 +60,8 @@ pub struct Connection {
     pub database: String,
     #[serde(default)]
     pub ssl: SslMode,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub ssl_root_cert: String,
     /// Palette name (`"red"`) or `#rrggbb`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub color: Option<String>,
@@ -93,7 +96,8 @@ impl Connection {
                 DbKind::Postgres => "postgres".into(),
                 DbKind::Redshift => "dev".into(),
             },
-            ssl: SslMode::Prefer,
+            ssl: SslMode::VerifyFull,
+            ssl_root_cert: String::new(),
             color: None,
             autocommit: true,
             project_key: 0,
@@ -125,6 +129,7 @@ impl Connection {
             user: creds.user,
             password: creds.password,
             ssl: self.ssl,
+            ssl_root_cert: self.ssl_root_cert.clone(),
             connect_timeout: Duration::from_secs(10),
             application_name: "good-query".into(),
         }
@@ -222,16 +227,9 @@ pub(crate) fn read_toml<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<Opt
 
 /// Write via a temp file + rename so a crash never leaves a torn file.
 pub(crate) fn write_atomic(path: &Path, text: &str) -> Result<()> {
-    let io = |p: &Path| {
-        let p = p.to_path_buf();
-        move |source| ConfigError::Io { path: p, source }
-    };
     let dir = path.parent().unwrap_or(Path::new("."));
-    std::fs::create_dir_all(dir).map_err(io(dir))?;
-    let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-    let tmp = dir.join(format!(".{name}.tmp"));
-    std::fs::write(&tmp, text).map_err(io(&tmp))?;
-    std::fs::rename(&tmp, path).map_err(io(path))
+    std::fs::create_dir_all(dir).map_err(|source| ConfigError::Io { path: dir.into(), source })?;
+    files::write_atomic(path, text, None, true).map_err(|source| ConfigError::Io { path: path.into(), source })
 }
 
 /// Where app config lives. `Store::default_location()` is the user config

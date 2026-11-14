@@ -93,11 +93,27 @@ fn export_reports_stopped_producer_and_cancel() {
     let path = d.path().join("a.csv");
     let (status, n) = export_csv(&s, &path, &CsvOptions::default(), |_| true).unwrap().unwrap();
     assert_eq!((status, n), (Status::Stopped("cancelled".into()), 50));
+    assert!(!path.exists());
 
     // Cancelling the export removes the partial file.
     let p2 = d.path().join("b.csv");
     assert!(export_csv(&s, &p2, &CsvOptions::default(), |_| false).unwrap().is_none());
     assert!(!p2.exists());
+}
+
+#[test]
+fn export_never_overwrites_an_existing_destination() {
+    let d = dir();
+    let s = Spool::create(d.path(), schema()).unwrap();
+    s.append(&batch(0, 50)).unwrap();
+    s.finish(Status::Complete);
+    let path = d.path().join("existing.csv");
+    std::fs::write(&path, "keep me").unwrap();
+    assert!(export_csv(&s, &path, &CsvOptions::default(), |_| true).is_err());
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "keep me");
+    assert!(export_csv(&s, &path, &CsvOptions::default(), |_| false).unwrap().is_none());
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "keep me");
+    assert_eq!(std::fs::read_dir(d.path()).unwrap().count(), 2);
 }
 
 #[test]

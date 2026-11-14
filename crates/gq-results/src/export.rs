@@ -32,10 +32,11 @@ pub fn export_csv(
     opts: &CsvOptions,
     mut on_progress: impl FnMut(u64) -> bool,
 ) -> Result<Option<(Status, u64)>> {
-    let file = std::fs::File::create(path)?;
+    let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let temp = tempfile::NamedTempFile::new_in(parent)?;
     let mut w = csv::WriterBuilder::new()
         .delimiter(opts.delimiter)
-        .from_writer(std::io::BufWriter::with_capacity(1 << 20, file));
+        .from_writer(std::io::BufWriter::with_capacity(1 << 20, temp.as_file()));
     let csv_err = |e: csv::Error| std::io::Error::other(e);
     if opts.header {
         w.write_record(spool.schema().fields().iter().map(|f| f.name().as_str())).map_err(csv_err)?;
@@ -67,11 +68,16 @@ pub fn export_csv(
     match status {
         Some(s) => {
             w.flush()?;
+            drop(w);
+            // Only publish complete results. Failure/cancel drops the temp file.
+            if s == Status::Complete {
+                temp.as_file().sync_all()?;
+                temp.persist_noclobber(path).map_err(|e| e.error)?;
+            }
             Ok(Some((s, written)))
         }
         None => {
             drop(w);
-            let _ = std::fs::remove_file(path);
             Ok(None)
         }
     }

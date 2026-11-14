@@ -361,7 +361,7 @@ impl TabActor {
                     finished(self, Outcome::Done { rows_affected, command });
                 }
                 Ok(Execution::Rows(stream)) => {
-                    let spool = match Spool::create(&self.opts.spool_dir, stream.schema()) {
+                    let spool = match Spool::create_with_limits(&self.opts.spool_dir, stream.schema(), self.opts.spool_limits.clone()) {
                         Ok(s) => s,
                         Err(e) => {
                             // Can't spool: close the stream on the server and report.

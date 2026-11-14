@@ -76,6 +76,6 @@ fn large_result_has_bounded_memory() {
         peak / MB
     );
     assert!(raw_bytes > 200 * MB);
-    // 16 cached batches of ~1.2MB + one batch being encoded + CSV buffer.
+    // Byte-limited decoded cache + transient encoding/decoding + CSV buffers.
     assert!(peak < 48 * MB, "peak heap {} MB", peak / MB);
 }

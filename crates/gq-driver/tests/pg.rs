@@ -11,6 +11,24 @@ async fn session() -> Box<dyn Session> {
     connect(&p).await.expect("connect")
 }
 
+#[tokio::test]
+async fn wide_results_stop_at_the_batch_byte_target_and_reject_huge_values() {
+    let mut s = session().await;
+    let Execution::Rows(mut stream) = s.execute("select repeat('x', 65536) from generate_series(1, 100)").await.unwrap() else { panic!("rows") };
+    let first = stream.next_batch(100, Duration::from_secs(5)).await.unwrap().unwrap();
+    assert!(first.num_rows() > 0 && first.num_rows() <= 64);
+    let mut count = first.num_rows();
+    while let Some(batch) = stream.next_batch(100, Duration::from_secs(5)).await.unwrap() { count += batch.num_rows(); }
+    assert_eq!(count, 100);
+    drop(stream);
+    let Execution::Rows(mut stream) = s.execute("select repeat('x', 8388609)").await.unwrap() else { panic!("rows") };
+    let error = stream.next_batch(1, Duration::from_secs(5)).await.unwrap_err();
+    assert!(error.message.contains("8 MiB"));
+    s.cancel_handle().cancel().await.unwrap();
+    drop(stream);
+    assert_eq!(scalar(&mut *s, "select 1").await.as_deref(), Some("1"));
+}
+
 async fn rows(s: &mut dyn Session, sql: &str) -> Vec<Vec<Option<String>>> {
     let Execution::Rows(mut st) = s.execute(sql).await.unwrap() else { panic!("expected rows") };
     let mut out = Vec::new();

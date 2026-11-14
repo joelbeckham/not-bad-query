@@ -2910,6 +2910,8 @@ name = "gq-app"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "arrow-array",
+ "arrow-schema",
  "chrono",
  "gpui-kit",
  "gq-core",
@@ -2950,6 +2952,8 @@ dependencies = [
  "gq-testkit",
  "postgres-types",
  "rustls",
+ "rustls-native-certs",
+ "rustls-pemfile",
  "serde",
  "thiserror 2.0.21",
  "tokio",

@@ -11,6 +11,7 @@ use std::time::Duration;
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::command::{Command, CommandItem, CommandState};
+use gpui_kit::component::dialog::{DialogAction, DialogClose, DialogFooter};
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::resizable::{h_resizable, resizable_panel};
 use gpui_kit::component::status_bar::StatusBar;
@@ -44,6 +45,7 @@ pub struct Workbench {
     next_untitled: usize,
     /// A close that needs confirming (second Ctrl+W).
     close_armed: Option<EntityId>,
+    quit_dialog_open: bool,
     palette: Entity<CommandState>,
     focus: FocusHandle,
     _tasks: Vec<Task<()>>,
@@ -145,6 +147,7 @@ impl Workbench {
             catalogs: Rc::new(RefCell::new(HashMap::new())),
             next_untitled: 1,
             close_armed: None,
+            quit_dialog_open: false,
             palette,
             focus: cx.focus_handle(),
             _tasks: vec![events, watch],
@@ -155,11 +158,54 @@ impl Workbench {
         for e in problems {
             error(window, cx, e);
         }
+        let owner = cx.weak_entity();
+        window.on_window_should_close(cx, move |window, cx| {
+            owner.update(cx, |wb, cx| wb.request_close(window, cx)).unwrap_or(true)
+        });
         wb
     }
 
     fn active_tab(&self) -> Option<&Entity<QueryTab>> {
         self.tabs.get(self.active)
+    }
+
+    fn request_close(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.tabs.iter().any(|tab| tab.read(cx).saving) {
+            error(window, cx, "Wait for the script save to finish before closing.");
+            return false;
+        }
+        if !self.tabs.iter().any(|tab| { let (dirty, pending) = self.tab_risk(tab, cx); dirty || pending }) {
+            return true;
+        }
+        if self.quit_dialog_open { return false; }
+        self.quit_dialog_open = true;
+        let owner = cx.weak_entity();
+        window.open_dialog(cx, move |dialog, _, _| {
+            let (ok, cancel) = (owner.clone(), owner.clone());
+            dialog.title("Quit good-query?")
+                .child("Unsaved scripts will be discarded. Running queries will stop and open transactions will roll back.")
+                .footer(DialogFooter::new()
+                    .child(DialogClose::new().child(Button::new("keep-working").outline().label("Keep working")))
+                    .child(DialogAction::new().child(Button::new("quit").primary().label("Quit"))))
+                .on_cancel(move |_, _, cx| { let _ = cancel.update(cx, |wb, _| wb.quit_dialog_open = false); true })
+                .on_ok(move |_, window, cx| {
+                    let _ = ok.update(cx, |wb, cx| {
+                        // A save may have started while the dialog was open.
+                        if wb.tabs.iter().any(|tab| tab.read(cx).saving) {
+                            wb.quit_dialog_open = false;
+                            error(window, cx, "Wait for the script save to finish before closing.");
+                            return;
+                        }
+                        for tab in &wb.tabs {
+                            let id = tab.read(cx).engine_tab;
+                            wb.engine.close_tab(id);
+                        }
+                        window.remove_window();
+                    });
+                    true
+                })
+        });
+        false
     }
 
     fn with_active(&self, cx: &mut Context<Self>, f: impl FnOnce(&mut QueryTab, &mut Context<QueryTab>)) {
@@ -211,11 +257,15 @@ impl Workbench {
     /// Whether closing would lose something: (unsaved edits, uncommitted changes).
     fn tab_risk(&self, tab: &Entity<QueryTab>, cx: &App) -> (bool, bool) {
         let t = tab.read(cx);
-        (t.dirty && !t.text(cx).trim().is_empty(), t.txn.in_txn && t.txn.pending_writes > 0)
+        (t.dirty, t.txn.in_txn || t.is_running() || t.saving)
     }
 
     fn close_tab(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(tab) = self.tabs.get(ix).cloned() else { return };
+        if tab.read(cx).saving {
+            error(window, cx, "Wait for the script save to finish before closing.");
+            return;
+        }
         let (dirty, pending) = self.tab_risk(&tab, cx);
         let id = tab.entity_id();
         if (dirty || pending) && self.close_armed != Some(id) {
@@ -280,7 +330,7 @@ impl Workbench {
     fn reuse_empty_tab(&self, cx: &App) -> Option<Entity<QueryTab>> {
         self.active_tab().cloned().filter(|t| {
             let t = t.read(cx);
-            t.path.is_none() && t.text(cx).trim().is_empty() && !t.is_running()
+            t.path.is_none() && t.text(cx).trim().is_empty() && !t.is_running() && !t.txn.in_txn && !t.saving
         })
     }
 
@@ -520,7 +570,7 @@ impl Workbench {
         }
         for (before, after) in reloaded {
             for old in &before {
-                if after.iter().any(|n| n.key() == old.key() && n != old) {
+                if !after.iter().any(|n| n.key() == old.key() && n == old) {
                     self.connection_changed(old, window, cx);
                 }
             }
@@ -642,10 +692,23 @@ impl Workbench {
             cx.notify();
             return;
         }
-        let text = match std::fs::read_to_string(&path) {
-            Ok(t) => t,
-            Err(e) => return error(window, cx, format!("{}: {e}", path.display())),
-        };
+        cx.spawn_in(window, async move |this, cx| {
+            let source = path.clone();
+            let result = cx.background_executor().spawn(async move { gq_core::files::read_script(&source) }).await;
+            let _ = this.update_in(cx, |wb, window, cx| match result {
+                Ok(text) => wb.show_file(path, text, window, cx),
+                Err(e) => error(window, cx, format!("{}: {e}", path.display())),
+            });
+        }).detach();
+    }
+
+    fn show_file(&mut self, path: PathBuf, text: String, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(ix) = self.tabs.iter().position(|t| t.read(cx).path.as_ref() == Some(&path)) {
+            self.active = ix;
+            self.focus_editor(window, cx);
+            cx.notify();
+            return;
+        }
         // The script's remembered connection; else keep the current one if
         // it's from the same project.
         let (project, conn) = {
@@ -674,15 +737,13 @@ impl Workbench {
 
     fn save(&mut self, save_as: bool, window: &mut Window, cx: &mut Context<Self>) {
         let Some(tab) = self.active_tab().cloned() else { return };
-        let (path, text, title, project, save_dir) = {
+        let (path, text, title, project, save_dir, expected) = {
             let t = tab.read(cx);
-            (t.path.clone(), t.text(cx), t.title(), t.project, t.save_dir.clone())
+            if t.saving { return; }
+            (t.path.clone(), t.text(cx), t.title(), t.project, t.save_dir.clone(), t.saved_text.clone())
         };
         if let (Some(p), false) = (path.clone(), save_as) {
-            match std::fs::write(&p, text) {
-                Ok(()) => tab.update(cx, |t, cx| t.mark_saved(p, cx)),
-                Err(e) => error(window, cx, format!("Save failed: {e}")),
-            }
+            self.save_script(tab, p, text, expected, window, cx);
             return;
         }
         let dir = path
@@ -699,15 +760,39 @@ impl Workbench {
             }
             let Some(f) = d.save_file().await else { return };
             let p = f.path().to_path_buf();
-            let _ = this.update_in(cx, |wb, window, cx| match std::fs::write(&p, &text) {
-                Ok(()) => {
-                    tab.update(cx, |t, cx| t.mark_saved(p, cx));
-                    wb.sidebar.update(cx, |s, cx| s.refresh(cx));
-                }
-                Err(e) => error(window, cx, format!("Save failed: {e}")),
+            let expected = if path.as_ref() == Some(&p) { expected } else { None };
+            let _ = this.update_in(cx, |wb, window, cx| {
+                wb.save_script(tab, p, text, expected, window, cx);
             });
         })
         .detach();
+    }
+
+    fn save_script(&mut self, tab: Entity<QueryTab>, path: PathBuf, text: String, expected: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
+        if tab.read(cx).saving { return; }
+        let t = tab.read(cx);
+        let project = project_for_path(&self.projects.borrow(), &path);
+        if project != t.project && (t.txn.in_txn || t.is_running()) {
+            error(window, cx, "Finish the query and commit or roll back before saving into another project.");
+            return;
+        }
+        tab.update(cx, |t, _| t.saving = true);
+        cx.spawn_in(window, async move |this, cx| {
+            let (target, contents) = (path.clone(), text.clone());
+            let result = cx.background_executor().spawn(async move {
+                gq_core::files::save_script(&target, &contents, expected.as_deref())
+            }).await;
+            let _ = this.update_in(cx, |wb, window, cx| {
+                tab.update(cx, |t, _| t.saving = false);
+                match result {
+                    Ok(()) => {
+                        tab.update(cx, |t, cx| t.mark_saved(path, text, cx));
+                        wb.sidebar.update(cx, |s, cx| s.refresh(cx));
+                    }
+                    Err(e) => error(window, cx, format!("Save failed: {e}")),
+                }
+            });
+        }).detach();
     }
 
     fn open_dialog_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -772,6 +857,8 @@ impl Workbench {
             if let Some(t) = self.active_tab().cloned() {
                 t.update(cx, |t, cx| t.export_csv(window, cx));
             }
+        } else if a.is::<CopyCell>() {
+            self.with_active(cx, |t, cx| t.copy_cell(cx));
         } else if a.is::<NewConnection>() {
             self.new_connection(window, cx);
         } else if a.is::<NewProject>() {
@@ -960,7 +1047,7 @@ impl Render for Workbench {
             .text_color(theme.foreground);
         let root = bind!(
             root, cx, RunStatement, RunScript, CancelQuery, Commit, Rollback, ToggleAutocommit, NewTab, CloseTab,
-            NextTab, PrevTab, SaveFile, SaveFileAs, OpenFile, ExportCsv, NewConnection, NewProject, OpenProject,
+            NextTab, PrevTab, SaveFile, SaveFileAs, OpenFile, ExportCsv, CopyCell, NewConnection, NewProject, OpenProject,
             CommandPalette, FocusEditor,
             ToggleTheme
         );

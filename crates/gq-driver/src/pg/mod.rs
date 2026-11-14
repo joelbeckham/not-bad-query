@@ -27,6 +27,7 @@ use crate::{
     Session, SslMode, meta,
 };
 pub use decode::{Plan, format_value, kind_of, plan};
+pub use tls::validate_ca_bundle;
 
 pub struct PgSession {
     client: Client,
@@ -62,18 +63,19 @@ impl PgSession {
             .ssl_mode(match p.ssl {
                 SslMode::Disable => tokio_postgres::config::SslMode::Disable,
                 SslMode::Prefer => tokio_postgres::config::SslMode::Prefer,
-                SslMode::Require => tokio_postgres::config::SslMode::Require,
+                SslMode::Require | SslMode::VerifyFull => tokio_postgres::config::SslMode::Require,
             });
         if let Some(pw) = &p.password {
             cfg.password(pw);
         }
+        let connector = if p.ssl == SslMode::Disable { None } else { Some(tls::make_tls(p)?) };
         let connect = async {
             if p.ssl == SslMode::Disable {
                 let (client, conn) = cfg.connect(tokio_postgres::NoTls).await?;
                 spawn_conn(conn);
                 Ok::<_, tokio_postgres::Error>((client, None))
             } else {
-                let tls = tls::make_tls();
+                let tls = connector.expect("TLS enabled");
                 let (client, conn) = cfg.connect(tls.clone()).await?;
                 spawn_conn(conn);
                 Ok((client, Some(tls)))
@@ -106,7 +108,7 @@ where
 pub(crate) fn map_err(e: tokio_postgres::Error) -> DriverError {
     if let Some(db) = e.as_db_error() {
         let code = db.code().code().to_string();
-        let kind = if code == "57014" { ErrorKind::Cancelled } else { ErrorKind::Query };
+        let kind = sqlstate_kind(&code);
         return DriverError {
             message: db.message().to_string(),
             position: match db.position() {
@@ -129,6 +131,23 @@ pub(crate) fn map_err(e: tokio_postgres::Error) -> DriverError {
         src = s.source();
     }
     DriverError::new(kind, msg)
+}
+
+fn sqlstate_kind(code: &str) -> ErrorKind {
+    if code == "57014" { ErrorKind::Cancelled }
+    else if code.starts_with("08") || matches!(code, "57P01" | "57P02" | "57P03") { ErrorKind::Connection }
+    else { ErrorKind::Query }
+}
+
+#[cfg(test)]
+mod connection_tests {
+    use super::*;
+    #[test]
+    fn fatal_server_errors_require_a_new_session() {
+        for code in ["08006", "08003", "57P01", "57P02", "57P03"] { assert_eq!(sqlstate_kind(code), ErrorKind::Connection); }
+        assert_eq!(sqlstate_kind("57014"), ErrorKind::Cancelled);
+        assert_eq!(sqlstate_kind("23505"), ErrorKind::Query);
+    }
 }
 
 fn no_params() -> impl ExactSizeIterator<Item = &'static (dyn ToSql + Sync)> {
@@ -164,6 +183,9 @@ impl Session for PgSession {
 
     async fn execute(&mut self, sql: &str) -> Result<Execution> {
         let stmt = self.client.prepare(sql).await.map_err(map_err)?;
+        if stmt.columns().len() > 1024 {
+            return Err(DriverError::new(ErrorKind::Query, "Results with more than 1024 columns are not supported"));
+        }
         if stmt.columns().is_empty() {
             let n = self.client.execute(&stmt, &[]).await.map_err(map_err)?;
             return Ok(Execution::Done { rows_affected: Some(n), command: command_tag(sql, self.dialect()) });
@@ -256,7 +278,8 @@ impl Col {
         }
     }
 
-    fn push(&mut self, raw: Option<&[u8]>, scratch: &mut String) {
+    fn push(&mut self, raw: Option<&[u8]>, scratch: &mut String) -> Result<usize> {
+        let mut bytes = raw.map_or(1, |r| r.len());
         macro_rules! fixed {
             ($b:expr, $t:ty) => {
                 match raw.and_then(|r| <[u8; size_of::<$t>()]>::try_from(r).ok()) {
@@ -283,11 +306,16 @@ impl Col {
                 Some(r) => {
                     scratch.clear();
                     format_value(ty, r, scratch);
+                    bytes = scratch.len();
+                    if bytes > crate::MAX_VALUE_BYTES {
+                        return Err(DriverError::new(ErrorKind::Query, "A formatted value exceeds the 8 MiB result limit"));
+                    }
                     b.append_value(&*scratch);
                 }
                 None => b.append_null(),
             },
         }
+        Ok(bytes)
     }
 
     fn finish(self) -> ArrayRef {
@@ -323,6 +351,7 @@ impl RowStream for PgRowStream {
         let mut scratch = String::new();
         let deadline = Instant::now() + soft_deadline;
         let mut n = 0;
+        let mut bytes = 0;
         while n < max_rows {
             let next = if n == 0 {
                 self.stream.next().await
@@ -344,11 +373,29 @@ impl RowStream for PgRowStream {
                     return Err(map_err(e));
                 }
                 Some(Ok(row)) => {
+                    let mut wire_bytes = 0usize;
+                    for i in 0..cols.len() {
+                        let Raw(raw) = row.try_get::<_, Raw>(i).map_err(map_err)?;
+                        let len = raw.map_or(1, |r| r.len());
+                        if len > crate::MAX_VALUE_BYTES {
+                            return Err(DriverError::new(ErrorKind::Query, "A value exceeds the 8 MiB result limit"));
+                        }
+                        wire_bytes += len;
+                    }
+                    if wire_bytes > crate::MAX_ROW_BYTES {
+                        return Err(DriverError::new(ErrorKind::Query, "A row exceeds the 16 MiB result limit"));
+                    }
+                    let mut row_bytes = 0;
                     for (i, c) in cols.iter_mut().enumerate() {
                         let Raw(raw) = row.try_get::<_, Raw>(i).map_err(map_err)?;
-                        c.push(raw, &mut scratch);
+                        row_bytes += c.push(raw, &mut scratch)?;
+                        if row_bytes > crate::MAX_ROW_BYTES {
+                            return Err(DriverError::new(ErrorKind::Query, "A formatted row exceeds the 16 MiB result limit"));
+                        }
                     }
                     n += 1;
+                    bytes += row_bytes;
+                    if bytes >= crate::TARGET_BATCH_BYTES { break; }
                 }
             }
         }

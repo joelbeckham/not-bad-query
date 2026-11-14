@@ -12,7 +12,7 @@ gq-app (GPUI views)  ──commands──▶  gq-engine (tokio runtime)
         ▲                               │  one actor per tab: owns its DB session
         └────────── Event channel ──────┘  one fetch task per result: stream → spool
         │
-        └── reads row windows directly from Arc<Spool> (disk + small LRU)
+        └── loads bounded row/column previews on a background executor
 ```
 
 * **Commands** are non-blocking methods on `Engine` (`execute`, `cancel`, `ensure_rows`,
@@ -26,9 +26,21 @@ gq-app (GPUI views)  ──commands──▶  gq-engine (tokio runtime)
 Drivers produce Arrow `RecordBatch`es. A fetch task appends each batch to a temp file
 as an LZ4-compressed Arrow IPC stream and records `(offset, len, first_row)` in an
 in-memory index. The grid asks `spool.read(rows)` for its visible window and gets
-zero-copy slices of the covering batches (decoded on demand, 16-batch LRU).
+zero-copy slices of the covering batches. Decoded caches are limited to 16 MiB per
+result and 64 MiB across an engine. The UI loads and formats previews off the render
+thread (at most 32 columns and approximately 4 MiB of preview text per window).
+Full-cell copying also reads on a background executor. Appends/compression run on
+Tokio's blocking pool rather than its session workers.
 
-Measured (`gq-results/tests/memory.rs`): 289MB of row data → 33MB on disk, 29MB peak heap
+Spools reject decoded batches over 32 MiB and cap each index at 262,144 entries.
+A shared 20 GiB budget covers compressed spool bytes; leases last until the final
+result/export owner drops. These limits do not cap total process memory: active
+decodes, driver protocol buffers, preview windows and index allocations are additional.
+The PostgreSQL driver targets 4 MiB batches, permits a final larger row (up to 16 MiB),
+and rejects values over 8 MiB or results wider than 1,024 columns. The PostgreSQL
+protocol necessarily receives an individual row before its value limits can be checked.
+
+Measured (`gq-results/tests/memory.rs`): 289 MiB of row data → 33 MiB on disk, 26 MiB peak tracked heap
 while scrolling randomly and exporting everything.
 
 ## Fetch policy: pause on the server
@@ -41,8 +53,10 @@ with no cursor and no transaction (verified in `gq-driver/tests/pg.rs`).
 
 * Statements that write (incl. `UPDATE ... RETURNING`) and all but the last statement
   of a script are always drained to completion.
-* **Export** sets demand to "everything" and streams the spool to CSV while it fills,
-  so the export is the exact result the user saw, never a re-run.
+* **Export** sets demand to "everything" and streams the spool to a same-directory
+  temporary CSV while it fills. Only a complete result is published, and an existing
+  destination is never overwritten. Failure/cancel removes the temporary file.
+  The export is the exact result the user saw, never a re-run.
 * Closing a paused result (new query, stop, commit) sends a server-side cancel.
 
 ## Transactions
@@ -55,6 +69,25 @@ with no cursor and no transaction (verified in `gq-driver/tests/pg.rs`).
 * Redshift has no savepoints: there, closing a paused result inside a transaction drains
   it instead of cancelling.
 * The tab shows pending writes and transaction age (`Event::Txn`).
+* The UI requires a query to finish and an open transaction to be resolved before
+  changing connections or commit mode. Closing a window with unsaved scripts or
+  pending work asks before discarding it. Closing a tab cancels execution before
+  its session actor shuts down and rolls back.
+
+## TLS and scripts
+
+New connections default to `verify-full`: certificate-chain and hostname validation
+use OS trust and optional public PEM roots. AWS public RDS roots supplement OS trust
+for AWS RDS/Redshift endpoint names. `disable`, `prefer`, and `require` remain readable
+for existing profiles; the latter two retain encryption-only semantics and the
+connection dialog identifies their lack of certificate verification. A custom CA
+bundle is portable connection metadata and must contain no private keys.
+
+Script reads and saves run on a background executor, with an 8 MiB script limit.
+An editor retains the opened/saved text revision. Saving rechecks that revision
+before atomic replacement, including each Windows sharing-violation retry. Save As
+creates a new file without clobbering an existing destination. Edits made during a
+save remain dirty after the saved snapshot is published.
 
 ## Cancel
 
@@ -99,4 +132,4 @@ exports/                           CSV export default (git-ignored)
 | `gq-driver` | real Postgres: type rendering oracle, pause (`ClientWrite`), cancel, errors |
 | `gq-results` | windows across batch boundaries, live export, CSV quoting, bounded memory |
 | `gq-engine` | headless E2E: scroll/fetch, export, cancel, txn commit/rollback, savepoint recovery, reconnect |
-| `gq-app` | GPUI `TestAppContext` keystroke tests + screenshots of the running app |
+| `gq-app` | Helper/completion unit tests; native screenshots reviewed by Claude via `AGENTS.md` |

@@ -38,11 +38,13 @@ pub struct EngineOptions {
     pub initial_rows: u64,
     /// Extra rows fetched beyond what the grid asked for.
     pub lookahead_rows: u64,
+    /// Clones share aggregate disk and decoded-cache budgets.
+    pub spool_limits: gq_results::SpoolLimits,
 }
 
 impl EngineOptions {
     pub fn new(spool_dir: PathBuf) -> Self {
-        EngineOptions { spool_dir, initial_rows: 500, lookahead_rows: 2000 }
+        EngineOptions { spool_dir, initial_rows: 500, lookahead_rows: 2000, spool_limits: Default::default() }
     }
 }
 
@@ -149,6 +151,7 @@ impl Engine {
     /// Close a tab. An open transaction is rolled back.
     pub fn close_tab(&self, tab: TabId) {
         if let Some(t) = self.tabs.lock().remove(&tab) {
+            self.rt().spawn(async move { t.shared.cancel().await });
             let _ = t.cmd.send(Cmd::Shutdown);
         }
     }
@@ -250,6 +253,9 @@ impl Engine {
 impl Drop for Engine {
     fn drop(&mut self) {
         for (_, t) in self.tabs.lock().drain() {
+            if let Some(rt) = &self.rt {
+                rt.spawn(async move { t.shared.cancel().await });
+            }
             let _ = t.cmd.send(Cmd::Shutdown);
         }
         // Give tabs a moment to roll back and close cursors, without

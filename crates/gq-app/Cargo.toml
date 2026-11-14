@@ -24,3 +24,5 @@ chrono = { workspace = true, features = ["clock"] }
 
 [dev-dependencies]
 tempfile.workspace = true
+arrow-array.workspace = true
+arrow-schema.workspace = true

@@ -18,6 +18,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::ops::Range;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use arrow_array::RecordBatch;
@@ -37,9 +38,48 @@ pub enum SpoolError {
     Arrow(#[from] arrow_schema::ArrowError),
     #[error("spool is closed")]
     Closed,
+    #[error("result storage limit: {0}")]
+    Limit(&'static str),
 }
 
 pub type Result<T, E = SpoolError> = std::result::Result<T, E>;
+
+/// Shared across results, including results retained by an export.
+#[derive(Debug)]
+pub struct ByteBudget {
+    used: AtomicU64,
+    limit: u64,
+}
+
+impl ByteBudget {
+    pub fn new(limit: u64) -> Arc<Self> { Arc::new(Self { used: AtomicU64::new(0), limit }) }
+    pub fn used(&self) -> u64 { self.used.load(Ordering::SeqCst) }
+    fn reserve(&self, bytes: u64) -> bool {
+        self.used.try_update(Ordering::SeqCst, Ordering::SeqCst, |used| used.checked_add(bytes).filter(|n| *n <= self.limit)).is_ok()
+    }
+    fn release(&self, bytes: u64) { self.used.fetch_sub(bytes, Ordering::SeqCst); }
+}
+
+#[derive(Debug, Clone)]
+pub struct SpoolLimits {
+    pub cache_bytes: usize,
+    pub max_batch_bytes: usize,
+    pub max_batches: usize,
+    pub disk: Arc<ByteBudget>,
+    pub cache: Arc<ByteBudget>,
+}
+
+impl Default for SpoolLimits {
+    fn default() -> Self {
+        Self {
+            cache_bytes: 16 * 1024 * 1024,
+            max_batch_bytes: 32 * 1024 * 1024,
+            max_batches: 262_144,
+            disk: ByteBudget::new(20 * 1024 * 1024 * 1024),
+            cache: ByteBudget::new(64 * 1024 * 1024),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 struct BatchMeta {
@@ -76,6 +116,8 @@ struct State {
 
 struct Lru {
     cap: usize,
+    bytes: usize,
+    budget: Arc<ByteBudget>,
     /// Most recently used last.
     entries: Vec<(usize, RecordBatch)>,
 }
@@ -89,11 +131,24 @@ impl Lru {
         Some(b)
     }
     fn put(&mut self, k: usize, b: RecordBatch) {
-        if self.entries.len() >= self.cap {
-            self.entries.remove(0);
+        // Concurrent misses can finish in either order. Never cache duplicates.
+        if self.entries.iter().any(|(key, _)| *key == k) { return; }
+        let bytes = b.get_array_memory_size();
+        if bytes > self.cap { return; }
+        while self.bytes + bytes > self.cap {
+            let (_, old) = self.entries.remove(0);
+            let freed = old.get_array_memory_size();
+            self.bytes -= freed;
+            self.budget.release(freed as u64);
         }
+        if !self.budget.reserve(bytes as u64) { return; }
+        self.bytes += bytes;
         self.entries.push((k, b));
     }
+}
+
+impl Drop for Lru {
+    fn drop(&mut self) { self.budget.release(self.bytes as u64); }
 }
 
 impl std::fmt::Debug for Spool {
@@ -111,6 +166,8 @@ pub struct Spool {
     reader: Mutex<File>,
     cache: Mutex<Lru>,
     write_opts: IpcWriteOptions,
+    limits: SpoolLimits,
+    reserved: AtomicU64,
     // Deleted when the spool is dropped.
     _file: tempfile::NamedTempFile,
 }
@@ -118,6 +175,10 @@ pub struct Spool {
 impl Spool {
     /// Create a spool file in `dir`.
     pub fn create(dir: &Path, schema: SchemaRef) -> Result<Arc<Spool>> {
+        Self::create_with_limits(dir, schema, SpoolLimits::default())
+    }
+
+    pub fn create_with_limits(dir: &Path, schema: SchemaRef, limits: SpoolLimits) -> Result<Arc<Spool>> {
         std::fs::create_dir_all(dir)?;
         let file = tempfile::Builder::new().prefix("gq-spool-").suffix(".arrows").tempfile_in(dir)?;
         let writer = file.reopen()?;
@@ -130,8 +191,10 @@ impl Spool {
             changed_lock: Mutex::new(()),
             writer: Mutex::new(Some(writer)),
             reader: Mutex::new(reader),
-            cache: Mutex::new(Lru { cap: 16, entries: Vec::new() }),
+            cache: Mutex::new(Lru { cap: limits.cache_bytes, bytes: 0, budget: limits.cache.clone(), entries: Vec::new() }),
             write_opts,
+            limits,
+            reserved: AtomicU64::new(0),
             _file: file,
         }))
     }
@@ -154,6 +217,9 @@ impl Spool {
         if batch.num_rows() == 0 {
             return Ok(());
         }
+        if batch.get_array_memory_size() > self.limits.max_batch_bytes || batch.num_rows() > u32::MAX as usize {
+            return Err(SpoolError::Limit("batch exceeds the byte limit"));
+        }
         let mut buf = Vec::with_capacity(batch.get_array_memory_size() / 2);
         {
             let mut w = StreamWriter::try_new_with_options(&mut buf, &self.schema, self.write_opts.clone())?;
@@ -162,6 +228,15 @@ impl Spool {
         }
         let mut wguard = self.writer.lock();
         let w = wguard.as_mut().ok_or(SpoolError::Closed)?;
+        if self.state.read().index.len() >= self.limits.max_batches {
+            return Err(SpoolError::Limit("batch index is full; close this result"));
+        }
+        let reservation = buf.len() as u64;
+        if !self.limits.disk.reserve(reservation) {
+            return Err(SpoolError::Limit("workspace disk budget reached; close an old result"));
+        }
+        // Includes partial writes after an IO error until this spool is dropped.
+        self.reserved.fetch_add(reservation, Ordering::SeqCst);
         let offset = {
             let s = self.state.read();
             s.bytes
@@ -221,6 +296,12 @@ impl Spool {
     /// Rows in `range` (clamped to what is available) as zero-copy slices,
     /// in order. Their row counts sum to the clamped range length.
     pub fn read(&self, range: Range<u64>) -> Result<Vec<RecordBatch>> {
+        self.read_bounded(range, usize::MAX)
+    }
+
+    /// Return a prefix of the row window with a decoded byte ceiling. One
+    /// covering batch is always allowed, bounded by max_batch_bytes.
+    pub fn read_bounded(&self, range: Range<u64>, max_bytes: usize) -> Result<Vec<RecordBatch>> {
         let metas: Vec<(usize, BatchMeta)> = {
             let s = self.state.read();
             let end = range.end.min(s.rows);
@@ -238,8 +319,12 @@ impl Spool {
         };
         let end = range.end.min(self.rows());
         let mut out = Vec::with_capacity(metas.len());
+        let mut bytes: usize = 0;
         for (i, m) in metas {
             let b = self.batch(i, m)?;
+            let size = b.get_array_memory_size();
+            if !out.is_empty() && bytes.saturating_add(size) > max_bytes { break; }
+            bytes += size;
             let lo = range.start.max(m.first_row) - m.first_row;
             let hi = end.min(m.first_row + m.rows as u64) - m.first_row;
             out.push(b.slice(lo as usize, (hi - lo) as usize));
@@ -256,7 +341,7 @@ impl Spool {
             let (pending, status, rows_seen) = {
                 let s = self.state.read();
                 let pending: Vec<(usize, BatchMeta)> =
-                    s.index[next..].iter().enumerate().map(|(j, m)| (next + j, *m)).collect();
+                    s.index[next..].iter().take(64).enumerate().map(|(j, m)| (next + j, *m)).collect();
                 (pending, s.status.clone(), s.rows)
             };
             for (i, m) in &pending {
@@ -288,4 +373,8 @@ impl Spool {
             .next()
             .ok_or_else(|| SpoolError::Arrow(arrow_schema::ArrowError::IpcError("empty spool batch".into())))??)
     }
+}
+
+impl Drop for Spool {
+    fn drop(&mut self) { self.limits.disk.release(self.reserved.load(Ordering::SeqCst)); }
 }

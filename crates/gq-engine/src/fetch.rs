@@ -130,8 +130,11 @@ impl FetchTask {
             match self.stream.next_batch(max, deadline).await {
                 Ok(Some(b)) => {
                     if !discard {
-                        if let Err(e) = spool.append(&b) {
+                        let target = spool.clone();
+                        let result = tokio::task::spawn_blocking(move || target.append(&b)).await;
+                        if let Err(e) = result.map_err(|e| e.to_string()).and_then(|r| r.map_err(|e| e.to_string())) {
                             let msg = format!("could not write result to disk: {e}");
+                            self.shared.cancel().await;
                             spool.finish(Status::Stopped(msg.clone()));
                             if first {
                                 self.first_done(Outcome::Failed(DriverError::new(ErrorKind::Query, msg.clone())));
@@ -162,6 +165,9 @@ impl FetchTask {
                     return FetchEnd { complete: !discard, error: None };
                 }
                 Err(e) => {
+                    if e.kind != ErrorKind::Cancelled {
+                        self.shared.cancel().await;
+                    }
                     let msg = if discard {
                         "closed".to_string()
                     } else if e.kind == ErrorKind::Cancelled {

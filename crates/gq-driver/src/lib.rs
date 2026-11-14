@@ -16,6 +16,10 @@ use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 
+pub const MAX_VALUE_BYTES: usize = 8 * 1024 * 1024;
+pub const MAX_ROW_BYTES: usize = 16 * 1024 * 1024;
+pub const TARGET_BATCH_BYTES: usize = 4 * 1024 * 1024;
+
 pub mod display;
 pub mod pg;
 
@@ -92,6 +96,8 @@ pub enum SslMode {
     #[default]
     Prefer,
     Require,
+    #[serde(rename = "verify-full")]
+    VerifyFull,
 }
 
 /// Everything needed to open a session. Passwords are resolved from the OS
@@ -105,6 +111,8 @@ pub struct ConnectParams {
     pub user: String,
     pub password: Option<String>,
     pub ssl: SslMode,
+    /// Optional public PEM roots, portable with a project. No private keys.
+    pub ssl_root_cert: String,
     pub connect_timeout: Duration,
     /// Shown in `pg_stat_activity.application_name` and similar.
     pub application_name: String,

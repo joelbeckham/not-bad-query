@@ -18,6 +18,7 @@ struct Choices {
     ssl: SslMode,
     color: Option<String>,
     autocommit: bool,
+    ca: String,
 }
 
 /// Open the dialog. `on_save(connection, user, new_password)`; `new_password` is
@@ -55,6 +56,7 @@ pub fn open(
         ssl: base.ssl,
         color: base.color.clone(),
         autocommit: base.autocommit,
+        ca: base.ssl_root_cert.clone(),
     }));
     let on_save = Rc::new(on_save);
     let first = std::cell::Cell::new(true);
@@ -132,8 +134,43 @@ pub fn open(
                     .child(div().text_xs().text_color(theme.muted_foreground).w(px(40.)).child("SSL"))
                     .child(seg("ssl-off", "Disable", ch.ssl == SslMode::Disable, Rc::new(|c| c.ssl = SslMode::Disable)))
                     .child(seg("ssl-pref", "Prefer", ch.ssl == SslMode::Prefer, Rc::new(|c| c.ssl = SslMode::Prefer)))
-                    .child(seg("ssl-req", "Require", ch.ssl == SslMode::Require, Rc::new(|c| c.ssl = SslMode::Require))),
+                    .child(seg("ssl-req", "Require", ch.ssl == SslMode::Require, Rc::new(|c| c.ssl = SslMode::Require)))
+                    .child(seg("ssl-verify", "Verify full", ch.ssl == SslMode::VerifyFull, Rc::new(|c| c.ssl = SslMode::VerifyFull))),
             )
+            .when(ch.ssl == SslMode::Prefer || ch.ssl == SslMode::Require, |body| body.child(
+                div().text_xs().text_color(theme.warning).child("Server identity is not verified. Use Verify full to validate its certificate.")
+            ))
+            .when(ch.ssl == SslMode::VerifyFull, |body| body.child(
+                h_flex().gap_2().items_center()
+                    .child(div().text_xs().text_color(theme.muted_foreground).w(px(40.)).child("CA"))
+                    .child({
+                        let choices = choices.clone();
+                        Button::new("import-ca").small().outline().label("Import CA…").on_click(move |_, window, cx| {
+                            let choices = choices.clone();
+                            window.spawn(cx, async move |cx| {
+                                let Some(file) = rfd::AsyncFileDialog::new().add_filter("Public CA", &["pem", "crt"]).pick_file().await else { return };
+                                let result = cx.background_executor().spawn(async move {
+                                    use std::io::Read;
+                                    let mut pem = String::new();
+                                    std::fs::File::open(file.path())?.take(512 * 1024 + 1).read_to_string(&mut pem)?;
+                                    gq_driver::pg::validate_ca_bundle(&pem).map_err(std::io::Error::other)?;
+                                    Ok::<_, std::io::Error>(pem)
+                                }).await;
+                                let _ = cx.update(|window, cx| match result {
+                                    Ok(pem) => { choices.borrow_mut().ca = pem; window.refresh(); }
+                                    Err(e) => window.push_notification(format!("CA import failed: {e}"), cx),
+                                });
+                            }).detach();
+                        })
+                    })
+                    .child(div().text_xs().child(if ch.ca.is_empty() { "System / AWS roots" } else { "Custom CA loaded" }))
+                    .when(!ch.ca.is_empty(), |row| {
+                        let choices = choices.clone();
+                        row.child(Button::new("clear-ca").xsmall().ghost().label("Clear").on_click(move |_, window, _| {
+                            choices.borrow_mut().ca.clear(); window.refresh();
+                        }))
+                    })
+            ))
             .child(
                 h_flex()
                     .gap_2()
@@ -202,6 +239,7 @@ pub fn open(
                 let user = v(&user);
                 c.kind = ch.kind;
                 c.ssl = ch.ssl;
+                c.ssl_root_cert = ch.ca.clone();
                 c.color = ch.color.clone();
                 c.autocommit = ch.autocommit;
                 let pw = password.read(cx).value().to_string();

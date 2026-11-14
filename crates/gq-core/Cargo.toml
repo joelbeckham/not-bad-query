@@ -15,6 +15,4 @@ directories = "6"
 keyring = "4.2"
 notify = "8"
 uuid = { workspace = true, features = ["v4"] }
-
-[dev-dependencies]
 tempfile.workspace = true

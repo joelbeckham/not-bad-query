@@ -390,3 +390,15 @@ async fn connection_failure_is_reported() {
     };
     assert_eq!(err.code.as_deref(), Some("28P01"), "{err:?}");
 }
+
+#[tokio::test]
+async fn closing_a_running_tab_cancels_instead_of_waiting_for_the_statement() {
+    let mut h = H::new("gq-e-close-running", true).await;
+    let mut observer = h.observer().await;
+    let query = h.engine.execute(h.tab, vec!["select pg_sleep(30)".into()]);
+    h.wait(|event| matches!(event, Event::StatementStarted { query: q, .. } if *q == query).then_some(())).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    h.engine.close_tab(h.tab);
+    h.wait(|event| matches!(event, Event::QueryDone { query: q, .. } if *q == query).then_some(())).await;
+    assert_eq!(active_queries(&mut *observer, "gq-e-close-running").await, "0");
+}

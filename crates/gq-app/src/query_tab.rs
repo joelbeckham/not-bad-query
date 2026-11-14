@@ -14,6 +14,7 @@ use gpui_kit::component::resizable::{resizable_panel, v_resizable};
 use gpui_kit::component::table::{DataTable, TableState};
 use gpui_kit::component::{ActiveTheme as _, Icon, IconName, Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
+use gpui_kit::component::Disableable as _;
 use gpui_kit::*;
 use gq_core::{Connection, Settings};
 use gq_driver::DriverError;
@@ -48,6 +49,8 @@ pub struct QueryTab {
     pub path: Option<PathBuf>,
     untitled: usize,
     pub dirty: bool,
+    pub saved_text: Option<String>,
+    pub saving: bool,
     pub conn_state: ConnState,
     pub txn: TxnState,
     /// (query, started, statements in the batch)
@@ -100,6 +103,8 @@ impl QueryTab {
             path: None,
             untitled,
             dirty: false,
+            saved_text: None,
+            saving: false,
             conn_state: ConnState::Disconnected,
             txn: TxnState { autocommit: true, in_txn: false, pending_writes: 0, since: None },
             running: None,
@@ -130,6 +135,14 @@ impl QueryTab {
     }
 
     pub fn set_connection(&mut self, conn: Option<Connection>, cx: &mut Context<Self>) {
+        if self.conn.is_some() && (self.txn.in_txn || self.is_running()) {
+            self.status = Status::Failed {
+                error: DriverError::connection("Finish the query and commit or roll back before changing connections."),
+                sql: String::new(), elapsed: Duration::ZERO,
+            };
+            cx.notify();
+            return;
+        }
         let params = conn.as_ref().map(crate::ui::params_for);
         let autocommit = conn.as_ref().map(|c| c.autocommit).unwrap_or(true);
         *self.completer_conn.borrow_mut() = conn.as_ref().map(|c| c.key());
@@ -244,7 +257,28 @@ impl QueryTab {
     }
 
     pub fn toggle_autocommit(&mut self) {
+        if self.txn.in_txn || self.is_running() {
+            return;
+        }
         self.engine.set_autocommit(self.engine_tab, !self.txn.autocommit);
+    }
+
+    pub fn copy_cell(&self, cx: &mut Context<Self>) {
+        let grid = self.grid.read(cx);
+        let (Some((row, col)), Some(spool)) = (grid.selected_cell(), grid.delegate().spool_for_export()) else { return };
+        let task = cx.background_executor().spawn(async move {
+            let batches = spool.read(row as u64..row as u64 + 1).map_err(|e| e.to_string())?;
+            let mut text = String::new();
+            if let Some(batch) = batches.first() {
+                gq_driver::display::cell_text(batch.column(col), 0, &mut text);
+            }
+            Ok::<_, String>(text)
+        });
+        cx.spawn(async move |_, cx| {
+            if let Ok(text) = task.await {
+                let _ = cx.update(|cx| cx.write_to_clipboard(ClipboardItem::new_string(text)));
+            }
+        }).detach();
     }
 
     pub fn export_csv(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -290,6 +324,7 @@ impl QueryTab {
         self.editor.update(cx, |e, cx| e.set_value(text, window, cx));
         self.project = crate::ui::project_for_path(&self.projects.borrow(), &path);
         self.path = Some(path);
+        self.saved_text = Some(text.to_string());
         self.dirty = false;
         if self.conn.as_ref().map(|c| c.key()) != conn.as_ref().map(|c| c.key()) {
             self.set_connection(conn, cx);
@@ -301,8 +336,9 @@ impl QueryTab {
         self.editor.read(cx).value().to_string()
     }
 
-    pub fn mark_saved(&mut self, path: PathBuf, cx: &mut Context<Self>) {
-        self.dirty = false;
+    pub fn mark_saved(&mut self, path: PathBuf, text: String, cx: &mut Context<Self>) {
+        self.dirty = self.text(cx) != text;
+        self.saved_text = Some(text);
         if self.path.as_ref() != Some(&path) {
             self.set_path(path, cx);
         }
@@ -483,6 +519,7 @@ impl QueryTab {
                     .label(if manual { "Manual commit" } else { "Auto-commit" })
                     .icon(if manual { Icon::new(Lucide::Lock) } else { Icon::new(Lucide::Zap) })
                     .tooltip("Toggle auto-commit (Alt+A)")
+                    .disabled(self.txn.in_txn || self.is_running())
                     .on_click(cx.listener(|this, _, _, _| this.toggle_autocommit())),
             )
             .children(txn_chip)

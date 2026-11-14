@@ -50,6 +50,7 @@ pub fn pg() -> ConnectParams {
         user: "postgres".into(),
         password: Some("postgres".into()),
         ssl: SslMode::Disable,
+        ssl_root_cert: String::new(),
         connect_timeout: Duration::from_secs(10),
         application_name: "gq-test".into(),
     }
