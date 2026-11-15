@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Editor, EditorState, InputEvent};
+use gpui_kit::component::link::Link;
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::resizable::{resizable_panel, v_resizable};
 use gpui_kit::component::table::{DataTable, TableEvent, TableState};
@@ -455,12 +456,19 @@ impl QueryTab {
                         cx,
                     );
                 } else if done.is_some() {
+                    let export_path = path.clone();
+                    let file_name = path.file_name().unwrap_or(path.as_os_str()).to_string_lossy().into_owned();
                     window.push_notification(
-                        gpui_kit::component::notification::Notification::success(format!(
-                            "Exported {} rows to {}",
-                            fmt_count(rows),
-                            path.display()
-                        )),
+                        gpui_kit::component::notification::Notification::success(format!("Exported {} rows", fmt_count(rows)))
+                            .content(move |_, _, _| {
+                                let export_path = export_path.clone();
+                                Link::new("open-export")
+                                    .text_sm()
+                                    .overflow_hidden()
+                                    .child(div().truncate().child(file_name.clone()))
+                                    .on_click(move |_, _, cx| cx.open_with_system(&export_path))
+                                    .into_any_element()
+                            }),
                         cx,
                     );
                 }

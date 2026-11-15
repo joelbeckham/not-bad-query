@@ -35,6 +35,20 @@ and regeneration instructions are in `../../crates/nbq-app/assets/README.md`.
 
 ## Claude review status: pending access
 
+### Open exported CSV — 2026-11-14
+
+- `export-file-link.png`: the completion toast shows the exported row count and
+  an underlined filename on a separate line. Long filenames truncate within the
+  notification instead of displaying the full directory path.
+- Clicking the filename in the isolated sample-project preview opened that exact
+  25-row CSV in Excel through the system file association. The callback captures
+  the completed export's path, independently of later queries or exports.
+- The T3 **Open exports folder** command was added and executed successfully. It
+  opens `test-project/exports`, creating the directory when necessary.
+- Debug and release builds passed. A fresh read-only Claude review failed before
+  image inspection with the organization-access error below; Codex inspected the
+  native screenshot instead. Claude visual sign-off remains pending access.
+
 ### Initial fetch and scroll prefetch — 2026-11-14
 
 - `prefetch-initial.png`: a million-row local SELECT remains at 500 fetched rows

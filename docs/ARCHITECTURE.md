@@ -91,6 +91,10 @@ its implicit statement transaction until completion or cancellation.
   temporary CSV while it fills. Only a complete result is published, and an existing
   destination is never overwritten. Failure/cancel removes the temporary file.
   The export is the exact result the user saw, never a re-run.
+  The completed-export notification links the filename to the system's default
+  application. The T3 **Open exports folder** command opens `test-project/exports`
+  in Explorer; `dev/open-exports.ps1 -ProjectPath <project>` opens another project's
+  exports directory, creating it if needed.
 * Closing a paused result (new query, stop, commit) sends a server-side cancel.
 
 ## Transactions
