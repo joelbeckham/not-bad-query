@@ -35,6 +35,27 @@ and regeneration instructions are in `../../crates/nbq-app/assets/README.md`.
 
 ## Claude review status: pending access
 
+### Initial fetch and scroll prefetch — 2026-11-14
+
+- `prefetch-initial.png`: a million-row local SELECT remains at 500 fetched rows
+  after showing the first viewport and waiting.
+- `prefetch-before-threshold.png`: scrolling around rows 245–256 still shows
+  500 fetched rows.
+- `prefetch-after-threshold.png`: scrolling into the last 100 fetched rows starts
+  the next fetch; the existing demand margin/lookahead brings the count to 2900.
+
+The proximity trigger is now separate from the existing later-batch size.
+Smaller custom initial batches use a 20% proximity threshold, capped at 100.
+Partial batches from slow queries cannot extend demand until the configured
+initial fetch has been satisfied. All 14 app tests pass, including threshold,
+append/deduplication, partial-initial-batch and closed-result regression coverage.
+The native sample-project preview was driven by process-targeted mouse/wheel
+messages and exited cleanly after verification.
+
+A fresh read-only Claude screenshot review was attempted and failed before image
+inspection with the same organization-access error below. Codex inspected all
+three stages; Claude visual sign-off remains pending access.
+
 ### Result-cell clipboard focus — 2026-11-14
 
 - `results-cell-copy.png`: selecting a result cell now explicitly focuses the

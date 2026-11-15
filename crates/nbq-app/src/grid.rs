@@ -23,6 +23,7 @@ const PREVIEW_ROWS: usize = 32;
 const PREVIEW_COLS: usize = 16;
 const PREVIEW_BYTES: usize = 4 * 1024 * 1024;
 const PREVIEW_TILES: usize = 64;
+const PREFETCH_THRESHOLD: usize = 100;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct PreviewRange {
@@ -98,6 +99,7 @@ pub struct ResultGrid {
     cols: Vec<Col>,
     /// Rows available in the spool (refreshed on fetch events).
     rows: usize,
+    initial_rows: u64,
     preview: PreviewCache,
     visible: PreviewRange,
     /// Rows the grid has asked the engine for.
@@ -108,7 +110,7 @@ pub struct ResultGrid {
 }
 
 impl ResultGrid {
-    pub fn new(engine: Arc<Engine>, tab: TabId) -> Self {
+    pub fn new(engine: Arc<Engine>, tab: TabId, initial_rows: u64) -> Self {
         ResultGrid {
             engine,
             tab,
@@ -116,6 +118,7 @@ impl ResultGrid {
             spool: None,
             cols: Vec::new(),
             rows: 0,
+            initial_rows,
             preview: PreviewCache::default(),
             visible: PreviewRange { rows: 0..0, cols: 0..0 },
             requested: 0,
@@ -162,6 +165,23 @@ impl ResultGrid {
 
     pub fn has_result(&self) -> bool {
         self.spool.is_some()
+    }
+
+    fn prefetch(&mut self, visible: Range<usize>) {
+        let (Some(query), Some(spool)) = (self.query, &self.spool) else { return };
+        if visible.is_empty() || spool.progress().status != nbq_engine::SpoolStatus::Open { return; }
+        // Slow queries publish partial batches before the initial fetch ends.
+        // Let that existing demand finish instead of extending it on first paint.
+        if (self.rows as u64) < self.initial_rows { return; }
+        // Keep the proximity trigger separate from the requested lookahead.
+        // Small custom initial batches use a proportionally smaller threshold.
+        let threshold = (self.rows / 5).clamp(1, PREFETCH_THRESHOLD);
+        if self.rows.saturating_sub(visible.end) > threshold { return; }
+        let want = (visible.end as u64).saturating_add(500);
+        if want > self.requested {
+            self.requested = want;
+            self.engine.ensure_rows(self.tab, query, want);
+        }
     }
 
     /// Seed/recheck previews after a result replacement or append, even if the
@@ -341,16 +361,7 @@ impl TableDelegate for ResultGrid {
     fn visible_rows_changed(&mut self, range: Range<usize>, _: &mut Window, cx: &mut Context<TableState<Self>>) {
         self.visible.rows = range.clone();
         self.load_visible(cx);
-        let (Some(q), Some(spool)) = (self.query, &self.spool) else { return };
-        if spool.progress().status != nbq_engine::SpoolStatus::Open {
-            return;
-        }
-        // Ask for more once the viewport is within a page of the end.
-        let want = range.end as u64 + 500;
-        if want > self.rows as u64 && want > self.requested {
-            self.requested = want;
-            self.engine.ensure_rows(self.tab, q, want);
-        }
+        self.prefetch(range);
     }
 
     fn visible_columns_changed(&mut self, range: Range<usize>, _: &mut Window, cx: &mut Context<TableState<Self>>) {
@@ -371,7 +382,7 @@ mod tests {
         let spool = Spool::create(dir.path(), schema).unwrap();
         append_rows(&spool, 0..rows);
         let (engine, _) = Engine::new(nbq_engine::EngineOptions::new(dir.path().join("engine")));
-        let mut grid = ResultGrid::new(engine, TabId(1));
+        let mut grid = ResultGrid::new(engine, TabId(1), rows.min(500) as u64);
         grid.set_result(QueryId(1), spool.clone());
         (dir, grid, spool)
     }
@@ -390,6 +401,58 @@ mod tests {
             grid.preview.insert(PreviewTile { range, cells }, &grid.visible);
         }
         panic!("preview requests did not settle");
+    }
+
+    #[::core::prelude::v1::test]
+    fn prefetch_waits_until_scrolling_near_the_fetched_end() {
+        let (_dir, mut grid, spool) = fixture(500, 2);
+        for viewport in [0..20, 100..120, 379..399] {
+            grid.prefetch(viewport);
+            assert_eq!(grid.requested, 0, "initial/early scrolling fetched another batch");
+        }
+        grid.prefetch(380..400);
+        assert_eq!(grid.requested, 900);
+        grid.prefetch(380..400);
+        assert_eq!(grid.requested, 900);
+        append_rows(&spool, 500..2900);
+        grid.refresh_rows();
+        grid.prefetch(400..420);
+        assert_eq!(grid.requested, 900, "appending rows immediately requested another batch");
+        grid.prefetch(2780..2800);
+        assert_eq!(grid.requested, 3300);
+    }
+
+    #[::core::prelude::v1::test]
+    fn prefetch_respects_small_initial_batches_and_closed_results() {
+        let (_dir, mut grid, spool) = fixture(50, 2);
+        grid.prefetch(0..20);
+        assert_eq!(grid.requested, 0);
+        grid.prefetch(0..0);
+        assert_eq!(grid.requested, 0);
+        grid.prefetch(20..40);
+        assert_eq!(grid.requested, 540);
+        for status in [nbq_engine::SpoolStatus::Complete, nbq_engine::SpoolStatus::Stopped("closed".into())] {
+            spool.finish(status);
+            grid.requested = 0;
+            grid.prefetch(30..50);
+            assert_eq!(grid.requested, 0, "closed result requested more rows");
+        }
+    }
+
+    #[::core::prelude::v1::test]
+    fn partial_batches_do_not_extend_the_initial_fetch() {
+        let (_dir, mut grid, spool) = fixture(5, 2);
+        grid.initial_rows = 500;
+        grid.prefetch(0..5); // Slow query's first partial batch fills the viewport.
+        assert_eq!(grid.requested, 0);
+        append_rows(&spool, 5..80);
+        grid.refresh_rows();
+        grid.prefetch(60..80);
+        assert_eq!(grid.requested, 0);
+        append_rows(&spool, 80..500);
+        grid.refresh_rows();
+        grid.prefetch(380..400);
+        assert_eq!(grid.requested, 900);
     }
 
     #[::core::prelude::v1::test]

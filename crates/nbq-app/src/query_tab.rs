@@ -85,7 +85,7 @@ impl QueryTab {
                 Some(Rc::new(SqlCompleter { catalogs, conn: completer_conn.clone() }));
             s
         });
-        let grid = cx.new(|cx| TableState::new(ResultGrid::new(engine.clone(), engine_tab), window, cx).cell_selectable(true));
+        let grid = cx.new(|cx| TableState::new(ResultGrid::new(engine.clone(), engine_tab, settings.initial_rows), window, cx).cell_selectable(true));
         let subs = vec![cx.subscribe(&editor, |this, _, e: &InputEvent, cx| {
             if matches!(e, InputEvent::Change) && !this.dirty {
                 this.dirty = true;

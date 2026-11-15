@@ -76,6 +76,10 @@ while scrolling randomly and exporting everything.
 
 A result opens with `initial_rows` (500) fetched. After that the fetch task stops
 polling the driver stream until the grid asks for more (`ensure_rows` + lookahead).
+The grid waits until the viewport reaches the last 100 fetched rows before
+requesting another batch (20% for initial batches smaller than 500 rows). Its
+500-row demand margin and the engine's 2,000-row lookahead are separate from
+that trigger, so displaying the first page does not immediately fetch more.
 For Postgres an unpolled `tokio_postgres::RowStream` makes the connection stop reading
 the socket, so the backend blocks in `ClientWrite`: the result is paused **on the server**
 without an explicit cursor. Even in auto-commit, an unfinished SELECT can retain
