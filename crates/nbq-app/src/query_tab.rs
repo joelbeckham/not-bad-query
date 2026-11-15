@@ -30,7 +30,7 @@ pub enum Status {
     Running,
     Rows { elapsed: Duration },
     Done { message: String, elapsed: Duration },
-    Failed { error: DriverError, sql: String, elapsed: Duration },
+    Failed { error: DriverError, elapsed: Duration },
     Cancelled { elapsed: Duration },
 }
 
@@ -138,7 +138,7 @@ impl QueryTab {
         if self.conn.is_some() && (self.txn.in_txn || self.is_running()) {
             self.status = Status::Failed {
                 error: DriverError::connection("Finish the query and commit or roll back before changing connections."),
-                sql: String::new(), elapsed: Duration::ZERO,
+                elapsed: Duration::ZERO,
             };
             cx.notify();
             return;
@@ -196,7 +196,6 @@ impl QueryTab {
         if self.conn.is_none() {
             self.status = Status::Failed {
                 error: DriverError::connection("Pick a connection for this tab first (the chip at top left)."),
-                sql: String::new(),
                 elapsed: Duration::ZERO,
             };
             cx.notify();
@@ -385,7 +384,7 @@ impl QueryTab {
                         };
                         Status::Done { message, elapsed }
                     }
-                    Outcome::Failed(error) => Status::Failed { error, sql: String::new(), elapsed },
+                    Outcome::Failed(error) => Status::Failed { error, elapsed },
                     Outcome::Cancelled => Status::Cancelled { elapsed },
                 };
             }
