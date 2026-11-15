@@ -11,7 +11,7 @@ use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Editor, EditorState, InputEvent};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::resizable::{resizable_panel, v_resizable};
-use gpui_kit::component::table::{DataTable, TableState};
+use gpui_kit::component::table::{DataTable, TableEvent, TableState};
 use gpui_kit::component::{ActiveTheme as _, Icon, IconName, Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::component::Disableable as _;
@@ -90,6 +90,12 @@ impl QueryTab {
             if matches!(e, InputEvent::Change) && !this.dirty {
                 this.dirty = true;
                 cx.notify();
+            }
+        }), cx.subscribe_in(&grid, window, |_, grid, event: &TableEvent, window, cx| {
+            if matches!(event, TableEvent::SelectCell(..)) {
+                // Cell clicks stop bubbling inside DataTable, so selecting a
+                // cell must explicitly move keyboard focus out of the editor.
+                grid.focus_handle(cx).focus(window, cx);
             }
         })];
         QueryTab {

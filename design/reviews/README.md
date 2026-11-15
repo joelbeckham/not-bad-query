@@ -35,6 +35,40 @@ and regeneration instructions are in `../../crates/nbq-app/assets/README.md`.
 
 ## Claude review status: pending access
 
+### Result-cell clipboard focus — 2026-11-14
+
+- `results-cell-copy.png`: selecting a result cell now explicitly focuses the
+  table so its existing Ctrl+C binding reaches the CopyCell action. The SQL
+  editor keeps its own copy behavior when focused.
+
+All 11 app tests pass. Native input targeted only the isolated preview window;
+Ctrl+C passed clipboard assertions for the full 492-character multiline value
+(beyond the displayed preview), a numeric cell, NULL replacing previous content,
+editor selection copying, and copying again after returning to the results.
+The first clipboard-helper attempt hit an OLE restore error; the successful
+recheck used direct Win32 clipboard reads/writes. No clipboard contents were
+saved to disk or printed. The initial clipboard restore did not succeed.
+
+A fresh read-only Claude screenshot review was attempted and failed before image
+inspection with the same organization-access error below. Codex inspected the
+selected-cell/focus appearance; Claude visual sign-off remains pending access.
+
+### Tree column alignment — 2026-11-14
+
+- `tree-columns-before.png`: reproduced uneven leaf-icon indentation on the
+  sample project's `shop.order_summary` view, especially its longer timestamp type.
+- `tree-columns-normal.png`, `tree-columns-narrow.png`,
+  `tree-columns-minimum.png`, `tree-columns-wide.png`: the same expanded view at
+  four panel widths after the fix. Chevron slots and icons retain their widths;
+  column names share a fixed left edge. Secondary types yield first, and names
+  ellipsize when necessary. The widest capture shows complete type descriptions.
+
+All input, resize drags, and captures targeted the isolated development preview.
+All 11 app tests pass; the preview was closed after verification. A fresh
+read-only Claude design review was attempted but failed before image inspection
+with the same organization-access error below. Codex inspected all four widths;
+Claude visual sign-off remains pending access.
+
 ### Transaction inactivity and cleanup — 2026-11-14
 
 - `transaction-idle-expired.png`: the local sample-project preview used a

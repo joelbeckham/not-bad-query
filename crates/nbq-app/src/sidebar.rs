@@ -425,19 +425,19 @@ impl Sidebar {
             None => (Icon::new(IconName::File), None, None, false),
         };
         let section = matches!(node, Some(Node::Section { .. }));
-        let chevron = match folder {
-            Some(open) => Icon::new(if open { IconName::ChevronDown } else { IconName::ChevronRight })
-                .xsmall()
-                .text_color(muted)
-                .into_any_element(),
-            None => div().w(px(12.)).into_any_element(),
-        };
+        // Keep indentation and icons rigid when the panel narrows. Only the
+        // text may yield; shrinking these slots offsets every row differently.
+        let chevron = div().w(px(12.)).h(px(12.)).flex_shrink_0().when_some(folder, |el, open| {
+            el.child(Icon::new(if open { IconName::ChevronDown } else { IconName::ChevronRight }).xsmall().text_color(muted))
+        });
         h_flex()
+            .w_full()
+            .min_w_0()
             .gap_1p5()
             .items_center()
             .overflow_hidden()
             .child(chevron)
-            .child(icon.small().when_some(color, |i, c| i.text_color(c)))
+            .child(icon.small().flex_shrink_0().when_some(color, |i, c| i.text_color(c)))
             .when_some(match node { Some(Node::Conn { state, .. }) => Some(state), _ => None }, |el, state| {
                 let (icon, color) = match state {
                     ConnState::Disconnected => (Lucide::Circle, muted),
@@ -455,16 +455,27 @@ impl Sidebar {
                     .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx)))
             })
             .child(
-                div()
-                    .text_sm()
-                    .whitespace_nowrap()
-                    .when(strong, |d| d.font_weight(FontWeight::MEDIUM))
-                    .when(section, |d| d.text_color(muted))
-                    .child(label),
+                h_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .gap_1p5()
+                    .overflow_hidden()
+                    .child(
+                        div()
+                            .max_w_full()
+                            .flex_shrink_0()
+                            .text_sm()
+                            .whitespace_nowrap()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .when(strong, |d| d.font_weight(FontWeight::MEDIUM))
+                            .when(section, |d| d.text_color(muted))
+                            .child(label),
+                    )
+                    .when_some(detail, |el, d| {
+                        el.child(div().flex_1().min_w_0().text_xs().whitespace_nowrap().text_color(muted).overflow_hidden().text_ellipsis().child(d))
+                    }),
             )
-            .when_some(detail, |el, d| {
-                el.child(div().text_xs().whitespace_nowrap().text_color(muted).overflow_hidden().text_ellipsis().child(d))
-            })
             .into_any_element()
     }
 
