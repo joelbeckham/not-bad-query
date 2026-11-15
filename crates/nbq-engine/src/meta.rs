@@ -9,9 +9,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use nbq_driver::{ConnectParams, DriverError, Execution, Session, display::cell_text};
-use tokio::sync::{Mutex as AsyncMutex, mpsc};
+use tokio::sync::{Mutex as AsyncMutex, mpsc, watch};
 
-use crate::Event;
+use crate::{ConnState, Event};
 
 /// Where in the object tree to list children.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -345,12 +345,67 @@ pub async fn catalog(s: &mut dyn Session) -> Result<Vec<CatalogTable>, DriverErr
 pub(crate) struct MetaConn {
     params: ConnectParams,
     session: AsyncMutex<Option<Box<dyn Session>>>,
+    conn: String,
+    events: mpsc::UnboundedSender<Event>,
+    // Serialize retirement with event publication, so an old request can never
+    // repopulate a refreshed/disconnected profile's UI or catalog.
+    retired: parking_lot::Mutex<bool>,
+    stop: watch::Sender<bool>,
 }
 
 impl MetaConn {
-    pub fn new(mut params: ConnectParams) -> Arc<Self> {
+    pub fn new(mut params: ConnectParams, conn: String, events: mpsc::UnboundedSender<Event>) -> Arc<Self> {
         params.application_name = format!("{} (metadata)", params.application_name);
-        Arc::new(MetaConn { params, session: AsyncMutex::new(None) })
+        Arc::new(MetaConn {
+            params, session: AsyncMutex::new(None), conn, events,
+            retired: parking_lot::Mutex::new(false), stop: watch::channel(false).0,
+        })
+    }
+
+    pub fn emit(&self, event: Event) {
+        if !*self.retired.lock() {
+            send(&self.events, event);
+        }
+    }
+
+    fn state(&self, state: ConnState) {
+        self.emit(Event::MetadataConn { conn: self.conn.clone(), state });
+    }
+
+    pub fn retire(&self) {
+        let mut retired = self.retired.lock();
+        *retired = true;
+        self.stop.send_replace(true);
+        send(&self.events, Event::MetadataConn { conn: self.conn.clone(), state: ConnState::Disconnected });
+    }
+
+    /// Cancel both queued and in-flight work, including a pending TCP connect.
+    pub async fn until_retired<T>(&self, work: impl std::future::Future<Output = T>) -> Option<T> {
+        let mut stop = self.stop.subscribe();
+        tokio::select! {
+            biased;
+            _ = stop.wait_for(|stopped| *stopped) => None,
+            result = work => Some(result),
+        }
+    }
+
+    pub async fn close(&self) {
+        self.session.lock().await.take();
+    }
+
+    async fn ensure_session(&self, session: &mut Option<Box<dyn Session>>) -> Result<(), DriverError> {
+        if session.as_ref().is_none_or(|s| s.is_closed()) {
+            self.state(ConnState::Connecting);
+            match nbq_driver::connect(&self.params).await {
+                Ok(s) => { *session = Some(s); self.state(ConnState::Connected); }
+                Err(e) => { self.state(ConnState::Failed(e.clone())); return Err(e); }
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn connect(&self) -> Result<(), DriverError> {
+        self.ensure_session(&mut *self.session.lock().await).await
     }
 
     pub fn same_params(&self, p: &ConnectParams) -> bool {
@@ -360,28 +415,29 @@ impl MetaConn {
             && self.params.user == p.user
             && self.params.password == p.password
             && self.params.kind == p.kind
+            && self.params.ssl == p.ssl
+            && self.params.ssl_root_cert == p.ssl_root_cert
+            && self.params.connect_timeout == p.connect_timeout
     }
 
     pub async fn list(&self, path: &ObjPath) -> Result<Vec<ObjItem>, DriverError> {
         let mut g = self.session.lock().await;
-        if g.as_ref().is_none_or(|s| s.is_closed()) {
-            *g = Some(nbq_driver::connect(&self.params).await?);
-        }
+        self.ensure_session(&mut g).await?;
         let r = list(&mut **g.as_mut().unwrap(), path).await;
-        if r.is_err() && g.as_ref().is_some_and(|s| s.is_closed()) {
+        if let Err(e) = &r && (e.kind == nbq_driver::ErrorKind::Connection || g.as_ref().is_some_and(|s| s.is_closed())) {
             *g = None;
+            self.state(ConnState::Failed(e.clone()));
         }
         r
     }
 
     pub async fn catalog(&self) -> Result<Vec<CatalogTable>, DriverError> {
         let mut g = self.session.lock().await;
-        if g.as_ref().is_none_or(|s| s.is_closed()) {
-            *g = Some(nbq_driver::connect(&self.params).await?);
-        }
+        self.ensure_session(&mut g).await?;
         let r = catalog(&mut **g.as_mut().unwrap()).await;
-        if r.is_err() && g.as_ref().is_some_and(|s| s.is_closed()) {
+        if let Err(e) = &r && (e.kind == nbq_driver::ErrorKind::Connection || g.as_ref().is_some_and(|s| s.is_closed())) {
             *g = None;
+            self.state(ConnState::Failed(e.clone()));
         }
         r
     }
@@ -393,20 +449,24 @@ pub(crate) struct MetaPool {
 }
 
 impl MetaPool {
-    pub fn get(&self, conn_id: &str, params: &ConnectParams) -> Arc<MetaConn> {
+    pub fn get(&self, conn_id: &str, params: &ConnectParams, events: &mpsc::UnboundedSender<Event>) -> Arc<MetaConn> {
         let mut g = self.conns.lock();
         match g.get(conn_id) {
             Some(c) if c.same_params(params) => c.clone(),
             _ => {
-                let c = MetaConn::new(params.clone());
+                if let Some(old) = g.remove(conn_id) { old.retire(); }
+                let c = MetaConn::new(params.clone(), conn_id.into(), events.clone());
                 g.insert(conn_id.to_string(), c.clone());
                 c
             }
         }
     }
 
-    pub fn forget(&self, conn_id: &str) {
-        self.conns.lock().remove(conn_id);
+    pub fn forget(&self, conn_id: &str) -> Option<Arc<MetaConn>> {
+        let mut conns = self.conns.lock();
+        let c = conns.remove(conn_id)?;
+        c.retire();
+        Some(c)
     }
 }
 

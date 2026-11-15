@@ -35,6 +35,29 @@ and regeneration instructions are in `../../crates/nbq-app/assets/README.md`.
 
 ## Claude review status: pending access
 
+### Connection status and session controls — 2026-11-14
+
+The isolated debug preview opened `dev/sample-project`. These screenshots show
+the connection menu and status icon beside the environment-colored database icon:
+
+- `connection-status-connected.png`: green check, Connected label, Disconnect enabled.
+- `connection-status-disconnected.png`: gray ring, Disconnected label, Connect enabled.
+- `connection-status-connecting.png`: amber loader while a local TCP fixture holds the handshake open.
+- `connection-status-error.png`: red alert after that fixture closes the connection.
+- `connection-status-transaction-guard.png`: Disconnect refused while the tab has an open transaction.
+
+The connecting/error fixture was temporary and removed after capture. Native
+checks verified that Run reconnects a disconnected tab, rollback permits
+Disconnect, both tab and metadata backends disappear from `pg_stat_activity`, and
+the editor and already-fetched results remain. All 102 workspace tests pass,
+including connect cancellation, metadata retirement, paused-result disconnect,
+and aggregation of mixed session states.
+
+A new read-only Claude screenshot review was attempted through T3 Code and
+failed before inspecting any image with the organization-access error below.
+These screenshots have been inspected by Codex; Claude visual sign-off remains
+pending access.
+
 The T3 Claude review delegate, including fresh rename and application-icon reviews, failed
 before inspecting the screenshots:
 

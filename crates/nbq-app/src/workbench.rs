@@ -62,7 +62,7 @@ fn event_tab(ev: &Event) -> Option<TabId> {
         | Event::Fetch { tab, .. }
         | Event::QueryDone { tab, .. }
         | Event::Export { tab, .. } => *tab,
-        Event::Objects { .. } | Event::Catalog { .. } => return None,
+        Event::Objects { .. } | Event::Catalog { .. } | Event::MetadataConn { .. } => return None,
     })
 }
 
@@ -306,12 +306,17 @@ impl Workbench {
 
     fn on_event(&mut self, ev: Event, window: &mut Window, cx: &mut Context<Self>) {
         match ev {
+            Event::MetadataConn { conn, state } => {
+                self.sidebar.update(cx, |s, cx| s.on_metadata_state(conn, state, cx));
+            }
             Event::Objects { conn, path, items } => {
                 self.sidebar.update(cx, |s, cx| s.on_objects(conn, path, items, cx));
             }
             Event::Catalog { conn, tables } => match tables {
                 Ok(t) => {
-                    self.catalogs.borrow_mut().insert(conn, t);
+                    if !self.sidebar.read(cx).is_disconnected(&conn) {
+                        self.catalogs.borrow_mut().insert(conn, t);
+                    }
                 }
                 Err(e) => tracing::warn!("catalog for {conn}: {e}"),
             },
@@ -319,7 +324,8 @@ impl Workbench {
                 let Some(tab_id) = event_tab(&ev) else { return };
                 let Some(tab) = self.tabs.iter().find(|t| t.read(cx).engine_tab == tab_id).cloned() else { return };
                 if let Event::Conn { state: ConnState::Connected, .. } = &ev {
-                    if let Some(c) = tab.read(cx).conn.clone() {
+                    if let Some(c) = tab.read(cx).conn.clone().filter(|_| tab.read(cx).session_enabled) {
+                        self.sidebar.update(cx, |s, _| s.allow_connection(&c.key()));
                         if !self.catalogs.borrow().contains_key(&c.key()) {
                             self.engine.load_catalog(&c.key(), &crate::ui::params_for(&c));
                         }
@@ -340,6 +346,36 @@ impl Workbench {
 
     fn on_sidebar(&mut self, ev: &SidebarEvent, window: &mut Window, cx: &mut Context<Self>) {
         match ev {
+            SidebarEvent::Connect(key) => {
+                let Some(c) = connection(&self.projects.borrow(), key) else { return };
+                self.sidebar.update(cx, |s, _| s.allow_connection(key));
+                self.engine.connect_profile(key, &crate::ui::params_for(&c));
+                for tab in &self.tabs {
+                    let t = tab.read(cx);
+                    if t.conn.as_ref().is_some_and(|c| c.key() == *key)
+                        && matches!(t.conn_state, ConnState::Disconnected | ConnState::Failed(_))
+                        && !t.txn.in_txn && !t.is_running()
+                    {
+                        tab.update(cx, |t, cx| t.reconnect(cx));
+                    }
+                }
+            }
+            SidebarEvent::Disconnect(key) => {
+                let tabs: Vec<_> = self.tabs.iter().filter(|t| {
+                    t.read(cx).conn.as_ref().is_some_and(|c| c.key() == *key)
+                }).cloned().collect();
+                if tabs.iter().any(|t| { let t = t.read(cx); t.txn.in_txn || t.is_running() }) {
+                    window.push_notification(Notification::warning(
+                        "Finish or cancel queries, then commit or roll back open transactions before disconnecting this connection."
+                    ), cx);
+                    return;
+                }
+                for tab in tabs { tab.update(cx, |t, cx| t.disconnect(cx)); }
+                self.engine.forget_connection(key);
+                self.catalogs.borrow_mut().remove(key);
+                self.sidebar.update(cx, |s, cx| s.disconnect(key, cx));
+                cx.notify();
+            }
             SidebarEvent::OpenConnection(key) => {
                 let c = connection(&self.projects.borrow(), key);
                 let project = c.as_ref().map(|c| c.project_key);
@@ -984,7 +1020,7 @@ impl Workbench {
                         ConnState::Connected => ("connected", theme.success),
                         ConnState::Connecting => ("connecting…", theme.warning),
                         ConnState::Failed(_) => ("failed", theme.danger),
-                        ConnState::Disconnected => ("idle", theme.muted_foreground),
+                        ConnState::Disconnected => ("disconnected", theme.muted_foreground),
                     };
                     h_flex()
                         .gap_2()
@@ -1035,6 +1071,11 @@ macro_rules! bind {
 
 impl Render for Workbench {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let states = self.tabs.iter().filter_map(|tab| {
+            let tab = tab.read(cx);
+            tab.conn.as_ref().map(|c| (c.key(), tab.conn_state.clone()))
+        }).collect();
+        self.sidebar.update(cx, |s, cx| s.set_tab_states(states, cx));
         let theme = cx.theme().clone();
         let active = self.active_tab().cloned();
         let title_conn = active.as_ref().and_then(|t| t.read(cx).conn.clone());

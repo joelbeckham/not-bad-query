@@ -17,7 +17,7 @@ use crate::fetch::{FetchCtl, FetchEnd, FetchTask, StopPolicy};
 use crate::{ConnState, EngineOptions, Event, Outcome, QueryId, TabId, TxnState};
 
 pub(crate) enum Cmd {
-    SetConnection { params: Option<ConnectParams>, autocommit: bool },
+    SetConnection { params: Option<ConnectParams>, autocommit: bool, revision: u64 },
     SetAutocommit(bool),
     Execute { query: QueryId, statements: Vec<String> },
     Commit,
@@ -25,9 +25,15 @@ pub(crate) enum Cmd {
     Shutdown,
 }
 
-#[derive(Default)]
 pub(crate) struct TabShared {
     inner: Mutex<SharedInner>,
+    connection_revision: watch::Sender<u64>,
+}
+
+impl Default for TabShared {
+    fn default() -> Self {
+        Self { inner: Default::default(), connection_revision: watch::channel(0).0 }
+    }
 }
 
 #[derive(Default)]
@@ -39,6 +45,11 @@ struct SharedInner {
 }
 
 impl TabShared {
+    pub fn change_connection(&self) -> u64 {
+        self.connection_revision.send_modify(|r| *r += 1);
+        *self.connection_revision.borrow()
+    }
+
     pub fn set_running(&self, running: bool) {
         self.inner.lock().running = running;
     }
@@ -95,6 +106,7 @@ pub(crate) struct TabActor {
     events: mpsc::UnboundedSender<Event>,
     opts: EngineOptions,
     params: Option<ConnectParams>,
+    connection_revision: u64,
     session: Option<Box<dyn Session>>,
     txn: TxnState,
     fetch: Option<ActiveFetch>,
@@ -119,6 +131,7 @@ impl TabActor {
             events,
             opts,
             params: None,
+            connection_revision: 0,
             session: None,
             txn: TxnState { autocommit: true, in_txn: false, pending_writes: 0, since: None },
             fetch: None,
@@ -142,7 +155,9 @@ impl TabActor {
     pub async fn run(mut self) {
         while let Some(cmd) = self.rx.recv().await {
             match cmd {
-                Cmd::SetConnection { params, autocommit } => {
+                Cmd::SetConnection { params, autocommit, revision } => {
+                    if revision != *self.shared.connection_revision.borrow() { continue; }
+                    self.connection_revision = revision;
                     self.close_fetch().await;
                     if self.txn.in_txn {
                         let _ = self.simple("ROLLBACK").await;
@@ -190,7 +205,13 @@ impl TabActor {
     async fn connect(&mut self) -> bool {
         let Some(p) = self.params.clone() else { return false };
         self.emit(Event::Conn { tab: self.id, state: ConnState::Connecting });
-        match nbq_driver::connect(&p).await {
+        let mut revision = self.shared.connection_revision.subscribe();
+        let result = tokio::select! {
+            biased;
+            _ = revision.wait_for(|r| *r != self.connection_revision) => return false,
+            result = nbq_driver::connect(&p) => result,
+        };
+        match result {
             Ok(s) => {
                 self.shared.set_cancel(Some(s.cancel_handle()));
                 self.session = Some(s);
@@ -239,7 +260,7 @@ impl TabActor {
     fn on_error(&mut self, e: &DriverError) {
         if e.kind == ErrorKind::Connection || self.session.as_ref().is_some_and(|s| s.is_closed()) {
             self.drop_session();
-            self.emit(Event::Conn { tab: self.id, state: ConnState::Disconnected });
+            self.emit(Event::Conn { tab: self.id, state: ConnState::Failed(e.clone()) });
             if self.txn.in_txn {
                 self.reset_txn();
                 self.emit_txn();

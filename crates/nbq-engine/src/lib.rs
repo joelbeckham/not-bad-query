@@ -77,6 +77,8 @@ pub struct TxnState {
 #[derive(Debug, Clone)]
 pub enum Event {
     Conn { tab: TabId, state: ConnState },
+    /// Status of the dedicated object-browser session for a profile.
+    MetadataConn { conn: String, state: ConnState },
     Txn { tab: TabId, state: TxnState },
     /// A statement started executing (the running timer starts here).
     StatementStarted { tab: TabId, query: QueryId, index: usize, sql: String, at: Instant },
@@ -151,6 +153,7 @@ impl Engine {
     /// Close a tab. An open transaction is rolled back.
     pub fn close_tab(&self, tab: TabId) {
         if let Some(t) = self.tabs.lock().remove(&tab) {
+            t.shared.change_connection();
             self.rt().spawn(async move { t.shared.cancel().await });
             let _ = t.cmd.send(Cmd::Shutdown);
         }
@@ -159,7 +162,10 @@ impl Engine {
     /// Point a tab at a connection (or none). Connects eagerly in the
     /// background. Any open transaction on the previous connection is rolled back.
     pub fn set_connection(&self, tab: TabId, params: Option<ConnectParams>, autocommit: bool) {
-        self.send(tab, Cmd::SetConnection { params, autocommit });
+        if let Some(t) = self.tabs.lock().get(&tab) {
+            let revision = t.shared.change_connection();
+            let _ = t.cmd.send(Cmd::SetConnection { params, autocommit, revision });
+        }
     }
 
     pub fn set_autocommit(&self, tab: TabId, autocommit: bool) {
@@ -200,27 +206,37 @@ impl Engine {
 
     /// List the children of `path` in the object tree of connection `conn`.
     pub fn load_objects(&self, conn: &str, params: &ConnectParams, path: ObjPath) {
-        let mc = self.meta.get(conn, params);
-        let (events, conn) = (self.events.clone(), conn.to_string());
+        let mc = self.meta.get(conn, params, &self.events);
+        let conn = conn.to_string();
         self.rt().spawn(async move {
-            let items = mc.list(&path).await.map_err(|e| e.message);
-            meta::send(&events, Event::Objects { conn, path, items });
+            if let Some(items) = mc.until_retired(mc.list(&path)).await {
+                mc.emit(Event::Objects { conn, path, items: items.map_err(|e| e.message) });
+            }
         });
     }
 
     /// Load every relation and its columns (for autocomplete).
     pub fn load_catalog(&self, conn: &str, params: &ConnectParams) {
-        let mc = self.meta.get(conn, params);
-        let (events, conn) = (self.events.clone(), conn.to_string());
+        let mc = self.meta.get(conn, params, &self.events);
+        let conn = conn.to_string();
         self.rt().spawn(async move {
-            let tables = mc.catalog().await.map(Arc::new).map_err(|e| e.message);
-            meta::send(&events, Event::Catalog { conn, tables });
+            if let Some(tables) = mc.until_retired(mc.catalog()).await {
+                mc.emit(Event::Catalog { conn, tables: tables.map(Arc::new).map_err(|e| e.message) });
+            }
         });
+    }
+
+    /// Connect the object browser without opening a query tab.
+    pub fn connect_profile(&self, conn: &str, params: &ConnectParams) {
+        let mc = self.meta.get(conn, params, &self.events);
+        self.rt().spawn(async move { mc.until_retired(mc.connect()).await; });
     }
 
     /// Drop the metadata session of a connection (e.g. after editing it).
     pub fn forget_connection(&self, conn: &str) {
-        self.meta.forget(conn);
+        if let Some(mc) = self.meta.forget(conn) {
+            self.rt().spawn(async move { mc.close().await; });
+        }
     }
 
     /// Export the full result of `query` to CSV, fetching the rest of it if needed.

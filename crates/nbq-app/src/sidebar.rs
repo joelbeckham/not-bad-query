@@ -11,11 +11,12 @@ use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::list::ListItem;
 use gpui_kit::component::menu::{PopupMenu, PopupMenuItem};
 use gpui_kit::component::tree::{TreeEvent, TreeItem, TreeState, tree};
+use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{ActiveTheme as _, Icon, IconName, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use nbq_core::{FolderNode, Project, build_tree};
-use nbq_engine::Engine;
+use nbq_engine::{ConnState, Engine};
 use nbq_engine::meta::{ObjItem, ObjKind, ObjPath};
 
 use crate::ui::{Projects, connection, params_for, rgb_hsla};
@@ -23,6 +24,8 @@ use crate::ui::{Projects, connection, params_for, rgb_hsla};
 pub enum SidebarEvent {
     /// Open a tab on this connection (runtime key).
     OpenConnection(String),
+    Connect(String),
+    Disconnect(String),
     OpenScript(PathBuf),
     NewConnection { project: u32, folder: Option<String> },
     EditConnection(String),
@@ -41,7 +44,7 @@ enum Node {
     Project(u32),
     Section { project: u32, scripts: bool },
     Folder { project: u32, path: String },
-    Conn { key: String, color: Option<u32> },
+    Conn { key: String, color: Option<u32>, state: ConnState },
     Obj { conn: String, path: Option<ObjPath>, item: ObjItem },
     Note { error: bool },
     ScriptDir { project: u32, dir: PathBuf },
@@ -50,6 +53,30 @@ enum Node {
 
 /// (connection key, object path)
 type Key = (String, ObjPath);
+
+/// Surface failures even when another session for the same profile is healthy.
+fn combined_state<'a>(states: impl Iterator<Item = &'a ConnState>) -> ConnState {
+    let mut result = ConnState::Disconnected;
+    for state in states {
+        let rank = |s: &ConnState| match s {
+            ConnState::Disconnected => 0,
+            ConnState::Connected => 1,
+            ConnState::Failed(_) => 2,
+            ConnState::Connecting => 3,
+        };
+        if rank(state) > rank(&result) { result = state.clone(); }
+    }
+    result
+}
+
+fn status_text(state: &ConnState) -> &'static str {
+    match state {
+        ConnState::Disconnected => "Disconnected",
+        ConnState::Connecting => "Connecting…",
+        ConnState::Connected => "Connected",
+        ConnState::Failed(_) => "Connection error",
+    }
+}
 
 /// A scanned scripts folder.
 struct ScriptEntry {
@@ -69,6 +96,9 @@ pub struct Sidebar {
     nodes: Rc<HashMap<SharedString, Node>>,
     loaded: HashMap<Key, Result<Vec<ObjItem>, String>>,
     loading: HashSet<Key>,
+    metadata_states: HashMap<String, ConnState>,
+    tab_states: Vec<(String, ConnState)>,
+    disconnected: HashSet<String>,
     expanded: HashSet<SharedString>,
     /// Projects already shown once (new ones start expanded).
     seen: HashSet<u32>,
@@ -112,6 +142,9 @@ impl Sidebar {
             nodes: Rc::new(HashMap::new()),
             loaded: HashMap::new(),
             loading: HashSet::new(),
+            metadata_states: HashMap::new(),
+            tab_states: Vec::new(),
+            disconnected: HashSet::new(),
             expanded: HashSet::new(),
             seen: HashSet::new(),
             _subs: subs,
@@ -129,6 +162,8 @@ impl Sidebar {
             ps.iter().flat_map(|p| p.connections.connections.iter().map(|c| c.key())).collect();
         drop(ps);
         self.loaded.retain(|(conn, _), _| keys.contains(conn));
+        self.metadata_states.retain(|key, _| keys.contains(key));
+        self.disconnected.retain(|key| keys.contains(key));
         self.rebuild(cx);
     }
 
@@ -149,8 +184,46 @@ impl Sidebar {
     }
 
     pub fn refresh_connection(&mut self, key: &str, cx: &mut Context<Self>) {
+        self.allow_connection(key);
         self.engine.forget_connection(key);
         self.forget_connection(key, cx);
+    }
+
+    pub fn allow_connection(&mut self, key: &str) {
+        self.disconnected.remove(key);
+    }
+
+    pub fn is_disconnected(&self, key: &str) -> bool {
+        self.disconnected.contains(key)
+    }
+
+    pub fn disconnect(&mut self, key: &str, cx: &mut Context<Self>) {
+        self.disconnected.insert(key.into());
+        self.metadata_states.remove(key);
+        self.loaded.retain(|(c, _), _| c != key);
+        self.loading.retain(|(c, _)| c != key);
+        self.expanded.retain(|id| id.as_ref() != format!("c:{key}") && !id.starts_with(&format!("o:{key}:")));
+        self.rebuild(cx);
+    }
+
+    pub fn on_metadata_state(&mut self, key: String, state: ConnState, cx: &mut Context<Self>) {
+        if self.is_disconnected(&key) { return; }
+        self.metadata_states.insert(key, state);
+        self.rebuild(cx);
+    }
+
+    pub fn set_tab_states(&mut self, states: Vec<(String, ConnState)>, cx: &mut Context<Self>) {
+        if self.tab_states != states {
+            self.tab_states = states;
+            self.rebuild(cx);
+        }
+    }
+
+    fn connection_state(&self, key: &str) -> ConnState {
+        if self.is_disconnected(key) { return ConnState::Disconnected; }
+        combined_state(self.metadata_states.get(key).into_iter().chain(
+            self.tab_states.iter().filter(|(k, _)| k == key).map(|(_, state)| state)
+        ))
     }
 
     pub fn on_objects(&mut self, conn: String, path: ObjPath, items: Result<Vec<ObjItem>, String>, cx: &mut Context<Self>) {
@@ -182,6 +255,7 @@ impl Sidebar {
             _ => None,
         };
         let Some(key) = target else { return };
+        self.allow_connection(&key.0);
         if self.loaded.contains_key(&key) || self.loading.contains(&key) {
             return;
         }
@@ -252,7 +326,9 @@ impl Sidebar {
         for c in &f.connections {
             let key = c.key();
             let id: SharedString = format!("c:{key}").into();
-            nodes.insert(id.clone(), Node::Conn { key: key.clone(), color: c.color().map(|x| x.rgb) });
+            nodes.insert(id.clone(), Node::Conn {
+                key: key.clone(), color: c.color().map(|x| x.rgb), state: self.connection_state(&key),
+            });
             out.push(TreeItem::new(id, c.name.clone()).children(self.obj_children(&key, &ObjPath::Root, nodes)));
         }
         out
@@ -362,6 +438,22 @@ impl Sidebar {
             .overflow_hidden()
             .child(chevron)
             .child(icon.small().when_some(color, |i, c| i.text_color(c)))
+            .when_some(match node { Some(Node::Conn { state, .. }) => Some(state), _ => None }, |el, state| {
+                let (icon, color) = match state {
+                    ConnState::Disconnected => (Lucide::Circle, muted),
+                    ConnState::Connecting => (Lucide::LoaderCircle, theme.warning),
+                    ConnState::Connected => (Lucide::CircleCheck, theme.success),
+                    ConnState::Failed(_) => (Lucide::CircleAlert, theme.danger),
+                };
+                let tip = match state {
+                    ConnState::Failed(e) => format!("Connection error: {}", e.message),
+                    _ => status_text(state).to_string(),
+                };
+                el.child(div().id(SharedString::from(format!("status:{entry_id}")))
+                    .flex_shrink_0()
+                    .child(Icon::new(icon).xsmall().text_color(color))
+                    .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx)))
+            })
             .child(
                 div()
                     .text_sm()
@@ -436,10 +528,20 @@ impl Sidebar {
                 menu.item(item("Open", IconName::File).on_click(emit(Rc::new(move || SidebarEvent::OpenScript(p2.clone())))))
                     .item(reveal_item(path.parent().map(Path::to_path_buf).unwrap_or_default()))
             }
-            Some(Node::Conn { key, .. }) => {
-                let (a, c, d) = (key.clone(), key.clone(), key.clone());
+            Some(Node::Conn { key, state, .. }) => {
+                let (a, c, d, connect, disconnect) = (key.clone(), key.clone(), key.clone(), key.clone(), key.clone());
+                let active = !matches!(state, ConnState::Disconnected | ConnState::Failed(_));
                 let b = key;
-                menu.item(item("New query tab", IconName::Plus).on_click(emit(Rc::new(move || {
+                menu.item(PopupMenuItem::new(status_text(&state)).disabled(true))
+                .separator()
+                .item(PopupMenuItem::new("Connect").icon(Lucide::Plug).disabled(active).on_click(emit(Rc::new(move || {
+                    SidebarEvent::Connect(connect.clone())
+                }))))
+                .item(PopupMenuItem::new("Disconnect").icon(Lucide::Unplug).disabled(matches!(state, ConnState::Disconnected)).on_click(emit(Rc::new(move || {
+                    SidebarEvent::Disconnect(disconnect.clone())
+                }))))
+                .separator()
+                .item(item("New query tab", IconName::Plus).on_click(emit(Rc::new(move || {
                     SidebarEvent::OpenConnection(a.clone())
                 }))))
                 .item(
@@ -631,5 +733,20 @@ impl Render for Sidebar {
             .into_any_element()
         };
         v_flex().size_full().child(header).child(div().flex_1().overflow_hidden().child(body))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::combined_state;
+    use nbq_engine::ConnState;
+
+    #[test]
+    fn profile_state_includes_all_sessions_and_preserves_failures() {
+        let failed = ConnState::Failed(nbq_driver::DriverError::connection("connection lost"));
+        assert_eq!(combined_state([].iter()), ConnState::Disconnected);
+        assert_eq!(combined_state([ConnState::Disconnected, ConnState::Connected].iter()), ConnState::Connected);
+        assert_eq!(combined_state([ConnState::Connected, failed.clone()].iter()), failed);
+        assert_eq!(combined_state([failed, ConnState::Connecting].iter()), ConnState::Connecting);
     }
 }

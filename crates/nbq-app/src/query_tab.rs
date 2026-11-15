@@ -52,6 +52,7 @@ pub struct QueryTab {
     pub saved_text: Option<String>,
     pub saving: bool,
     pub conn_state: ConnState,
+    pub session_enabled: bool,
     pub txn: TxnState,
     /// (query, started, statements in the batch)
     running: Option<(QueryId, Instant)>,
@@ -106,6 +107,7 @@ impl QueryTab {
             saved_text: None,
             saving: false,
             conn_state: ConnState::Disconnected,
+            session_enabled: false,
             txn: TxnState { autocommit: true, in_txn: false, pending_writes: 0, since: None },
             running: None,
             current: None,
@@ -151,9 +153,28 @@ impl QueryTab {
             self.project = Some(c.project_key);
         }
         self.conn = conn;
-        self.conn_state = ConnState::Disconnected;
+        self.session_enabled = self.conn.is_some();
+        self.conn_state = if self.session_enabled { ConnState::Connecting } else { ConnState::Disconnected };
         self.remember_connection();
         cx.notify();
+    }
+
+    /// Keep the script and its selected profile, but release its live session.
+    pub fn disconnect(&mut self, cx: &mut Context<Self>) {
+        if self.txn.in_txn || self.is_running() { return; }
+        self.session_enabled = false;
+        self.conn_state = ConnState::Disconnected;
+        self.engine.set_connection(self.engine_tab, None, self.txn.autocommit);
+        cx.notify();
+    }
+
+    pub fn reconnect(&mut self, cx: &mut Context<Self>) {
+        if let Some(c) = &self.conn {
+            self.session_enabled = true;
+            self.conn_state = ConnState::Connecting;
+            self.engine.set_connection(self.engine_tab, Some(crate::ui::params_for(c)), self.txn.autocommit);
+            cx.notify();
+        }
     }
 
     /// Record this script's connection in the project's local state, so
@@ -201,6 +222,7 @@ impl QueryTab {
             cx.notify();
             return;
         }
+        if !self.session_enabled { self.reconnect(cx); }
         let q = self.engine.execute(self.engine_tab, statements);
         self.running = Some((q, Instant::now()));
         self.current = Some(q);
@@ -347,6 +369,7 @@ impl QueryTab {
     pub fn on_event(&mut self, ev: Event, window: &mut Window, cx: &mut Context<Self>) {
         match ev {
             Event::Conn { state, .. } => {
+                if !self.session_enabled && !matches!(state, ConnState::Disconnected) { return; }
                 if let ConnState::Failed(e) = &state {
                     window.push_notification(
                         gpui_kit::component::notification::Notification::error(format!("Connection failed: {e}")),
@@ -421,7 +444,7 @@ impl QueryTab {
                 }
                 self.export = Some((path, rows, done));
             }
-            Event::Objects { .. } | Event::Catalog { .. } => {}
+            Event::Objects { .. } | Event::Catalog { .. } | Event::MetadataConn { .. } => {}
         }
         cx.notify();
     }

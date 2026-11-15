@@ -3,7 +3,7 @@
 use std::time::Duration;
 
 use nbq_engine::meta::{ObjKind, ObjPath};
-use nbq_engine::{Engine, EngineOptions, Event};
+use nbq_engine::{ConnState, Engine, EngineOptions, Event};
 
 async fn setup(schema: &str) -> nbq_driver::ConnectParams {
     let p = tokio::task::spawn_blocking(nbq_testkit::pg).await.unwrap();
@@ -86,4 +86,75 @@ async fn catalog_lists_relations_with_columns() {
     assert_eq!(cols, ["id", "label", "note"]);
     let v = tables.iter().find(|t| t.schema == "t_meta_cat" && t.name == "v").unwrap();
     assert_eq!(v.kind, ObjKind::View);
+}
+
+async fn metadata_state(rx: &mut tokio::sync::mpsc::UnboundedReceiver<Event>) -> ConnState {
+    loop {
+        if let Event::MetadataConn { conn, state } = tokio::time::timeout(Duration::from_secs(10), rx.recv()).await.unwrap().unwrap() {
+            assert_eq!(conn, "c1");
+            return state;
+        }
+    }
+}
+
+#[tokio::test]
+async fn explicit_connect_disconnect_and_reconnect_releases_backend() {
+    use nbq_driver::{Execution, display::cell_text};
+    let mut p = tokio::task::spawn_blocking(nbq_testkit::pg).await.unwrap();
+    p.application_name = "nbq-meta-disconnect-test".into();
+    let mut observer = nbq_driver::connect(&p).await.unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let (engine, mut rx) = Engine::new(EngineOptions::new(dir.path().into()));
+    engine.connect_profile("c1", &p);
+    assert_eq!(metadata_state(&mut rx).await, ConnState::Connecting);
+    assert_eq!(metadata_state(&mut rx).await, ConnState::Connected);
+    // Browsing reuses the same backend.
+    objects(&engine, &mut rx, &p, ObjPath::Root).await;
+    let count_sql = "select count(*) from pg_stat_activity where application_name = 'nbq-meta-disconnect-test (metadata)'";
+    let count = async |observer: &mut Box<dyn nbq_driver::Session>| {
+        let Execution::Rows(mut rows) = observer.execute(count_sql).await.unwrap() else { panic!("expected rows") };
+        let batch = rows.next_batch(10, Duration::from_secs(1)).await.unwrap().unwrap();
+        let mut text = String::new();
+        cell_text(batch.column(0), 0, &mut text);
+        text
+    };
+    assert_eq!(count(&mut observer).await, "1");
+    engine.forget_connection("c1");
+    assert_eq!(metadata_state(&mut rx).await, ConnState::Disconnected);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while count(&mut observer).await != "0" { tokio::time::sleep(Duration::from_millis(20)).await; }
+    }).await.expect("metadata backend remained connected");
+    engine.connect_profile("c1", &p);
+    assert_eq!(metadata_state(&mut rx).await, ConnState::Connecting);
+    assert_eq!(metadata_state(&mut rx).await, ConnState::Connected);
+}
+
+#[tokio::test]
+async fn disconnect_cancels_pending_metadata_and_ignores_retired_results() {
+    let mut p = tokio::task::spawn_blocking(nbq_testkit::pg).await.unwrap();
+    let real = p.clone();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    p.host = "127.0.0.1".into();
+    p.port = listener.local_addr().unwrap().port();
+    p.ssl = nbq_driver::SslMode::Disable;
+    p.connect_timeout = Duration::from_secs(30);
+    let dir = tempfile::tempdir().unwrap();
+    let (engine, mut rx) = Engine::new(EngineOptions::new(dir.path().into()));
+    engine.load_objects("c1", &p, ObjPath::Root);
+    let (socket, _) = listener.accept().await.unwrap(); // Hold an unresponsive server open.
+    assert_eq!(metadata_state(&mut rx).await, ConnState::Connecting);
+    engine.load_catalog("c1", &p); // Also cancel queued work behind the connect.
+    engine.forget_connection("c1");
+    assert_eq!(metadata_state(&mut rx).await, ConnState::Disconnected);
+    drop(socket);
+    assert!(tokio::time::timeout(Duration::from_millis(150), rx.recv()).await.is_err(), "retired request published a stale result");
+    engine.load_objects("c1", &real, ObjPath::Root);
+    assert_eq!(metadata_state(&mut rx).await, ConnState::Connecting);
+    assert_eq!(metadata_state(&mut rx).await, ConnState::Connected);
+    loop {
+        if let Event::Objects { items, .. } = tokio::time::timeout(Duration::from_secs(10), rx.recv()).await.unwrap().unwrap() {
+            assert!(items.is_ok());
+            break;
+        }
+    }
 }

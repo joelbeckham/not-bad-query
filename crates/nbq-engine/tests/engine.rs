@@ -43,9 +43,6 @@ impl H {
                 .await
                 .expect("timed out waiting for event")
                 .expect("engine closed");
-            if let Event::Conn { state: ConnState::Failed(err), .. } = &e {
-                panic!("connection failed: {err}");
-            }
             if let Event::Txn { state, .. } = &e {
                 self.txn = Some(*state);
             }
@@ -401,4 +398,48 @@ async fn closing_a_running_tab_cancels_instead_of_waiting_for_the_statement() {
     h.engine.close_tab(h.tab);
     h.wait(|event| matches!(event, Event::QueryDone { query: q, .. } if *q == query).then_some(())).await;
     assert_eq!(active_queries(&mut *observer, "nbq-e-close-running").await, "0");
+}
+
+#[tokio::test]
+async fn disconnect_cancels_a_pending_tab_connect_without_waiting_for_timeout() {
+    let mut p = tokio::task::spawn_blocking(nbq_testkit::pg).await.unwrap();
+    let real = p.clone();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    p.host = "127.0.0.1".into();
+    p.port = listener.local_addr().unwrap().port();
+    p.ssl = nbq_driver::SslMode::Disable;
+    p.connect_timeout = Duration::from_secs(30);
+    let dir = tempfile::tempdir().unwrap();
+    let (engine, mut rx) = Engine::new(EngineOptions::new(dir.path().into()));
+    let tab = engine.open_tab();
+    engine.set_connection(tab, Some(p), true);
+    let (_socket, _) = listener.accept().await.unwrap();
+    engine.set_connection(tab, None, true);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            match rx.recv().await.unwrap() {
+                Event::Conn { state: ConnState::Disconnected, .. } => break,
+                Event::Conn { state: ConnState::Connected | ConnState::Failed(_), .. } => panic!("cancelled connect published a result"),
+                _ => {}
+            }
+        }
+    }).await.expect("disconnect waited for connect timeout");
+    engine.set_connection(tab, Some(real), true);
+    loop {
+        if let Event::Conn { state: ConnState::Connected, .. } = tokio::time::timeout(T, rx.recv()).await.unwrap().unwrap() { break; }
+    }
+}
+
+#[tokio::test]
+async fn disconnect_releases_a_paused_result_and_keeps_fetched_rows() {
+    let mut h = H::new("nbq-e-disconnect-paused", true).await;
+    let mut observer = h.observer().await;
+    let (_, events) = h.run("select i, repeat('x', 1000) from generate_series(1, 100000) i").await;
+    let spool = spool_of(&events);
+    assert!(spool.rows() > 0);
+    h.engine.set_connection(h.tab, None, true);
+    h.wait(|e| matches!(e, Event::Conn { state: ConnState::Disconnected, .. }).then_some(())).await;
+    assert!(matches!(spool.progress().status, SpoolStatus::Stopped(_)));
+    assert!(!spool.read(0..1).unwrap().is_empty());
+    assert_eq!(active_queries(&mut *observer, "nbq-e-disconnect-paused").await, "0");
 }

@@ -32,6 +32,17 @@ nbq-app (GPUI views)  ──commands──▶  nbq-engine (tokio runtime)
   `ResultOpened`, `StatementFinished`, `Fetch`, `Txn`, `Conn`, `QueryDone`, `Export`)
   flow back on an unbounded channel the UI drains.
 * Each **tab owns its own session**, so transactions are per tab.
+* A sidebar profile has **Connect / Disconnect** actions and a status icon:
+  disconnected, connecting, connected, or connection error. Status combines the
+  object-browser session and all tabs using that profile; a failed session stays
+  visible even if another is connected. Status is the last observed connection
+  state, updated on connection attempts and database operations.
+  Connect opens the browser session and retries disconnected/failed tabs.
+  Disconnect releases all of the profile's sessions and cancels pending connects,
+  retaining scripts, their selected profiles, and already-fetched result rows.
+  Running queries and open transactions must be resolved first. Running SQL again
+  reconnects the tab. Metadata retirement cancels queued/in-flight introspection
+  and suppresses stale events so disconnected caches cannot reappear.
 
 ## Results: the spool
 
