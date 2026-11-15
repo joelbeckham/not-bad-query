@@ -25,10 +25,16 @@ struct H {
 
 impl H {
     async fn new(app: &str, autocommit: bool) -> H {
+        Self::with_timeout(app, autocommit, Duration::from_secs(900)).await
+    }
+
+    async fn with_timeout(app: &str, autocommit: bool, timeout: Duration) -> H {
         let mut params = tokio::task::spawn_blocking(nbq_testkit::pg).await.unwrap();
         params.application_name = app.into();
         let dir = tempfile::tempdir().unwrap();
-        let (engine, rx) = Engine::new(EngineOptions::new(dir.path().join("spool")));
+        let mut opts = EngineOptions::new(dir.path().join("spool"));
+        opts.transaction_idle_timeout = timeout;
+        let (engine, rx) = Engine::new(opts);
         let tab = engine.open_tab();
         engine.set_connection(tab, Some(params.clone()), autocommit);
         let mut h = H { engine, rx, tab, params, dir, txn: None, fetch: Default::default() };
@@ -442,4 +448,142 @@ async fn disconnect_releases_a_paused_result_and_keeps_fetched_rows() {
     assert!(matches!(spool.progress().status, SpoolStatus::Stopped(_)));
     assert!(!spool.read(0..1).unwrap().is_empty());
     assert_eq!(active_queries(&mut *observer, "nbq-e-disconnect-paused").await, "0");
+}
+
+async fn no_backends(observer: &mut dyn Session, app: &str) {
+    let sql = format!("select count(*) from pg_stat_activity where application_name like '{app}%'");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while scalar(observer, &sql).await != "0" { tokio::time::sleep(Duration::from_millis(20)).await; }
+    }).await.expect("backend/transaction remained open");
+}
+
+#[tokio::test]
+async fn idle_transaction_rolls_back_pending_writes_and_reconnects_cleanly() {
+    let mut h = H::with_timeout("nbq-e-idle-expire", false, Duration::from_millis(500)).await;
+    let mut obs = h.observer().await;
+    obs.execute("drop table if exists e_idle_expire").await.unwrap();
+    obs.execute("create table e_idle_expire (a int)").await.unwrap();
+    h.ok("insert into e_idle_expire values (1)").await;
+    assert!(h.txn.unwrap().in_txn);
+    h.wait(|e| matches!(e, Event::TransactionExpired { .. }).then_some(())).await;
+    assert!(!h.txn.unwrap().in_txn);
+    assert_eq!(h.txn.unwrap().pending_writes, 0);
+    no_backends(&mut *obs, "nbq-e-idle-expire").await;
+    assert_eq!(scalar(&mut *obs, "select count(*) from e_idle_expire").await, "0");
+    h.ok("insert into e_idle_expire values (2)").await;
+    h.commit().await;
+    assert_eq!(scalar(&mut *obs, "select sum(a) from e_idle_expire").await, "2");
+}
+
+#[tokio::test]
+async fn database_activity_resets_idle_limit_and_long_running_queries_are_allowed() {
+    let mut h = H::with_timeout("nbq-e-idle-active", false, Duration::from_millis(600)).await;
+    let mut obs = h.observer().await;
+    obs.execute("drop table if exists e_idle_active").await.unwrap();
+    obs.execute("create table e_idle_active (a int)").await.unwrap();
+    h.ok("insert into e_idle_active values (1)").await;
+    for _ in 0..4 {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        h.ok("select 1").await;
+    }
+    h.ok("select pg_sleep(1)").await; // Active query exceeds the idle limit.
+    h.commit().await;
+    assert_eq!(scalar(&mut *obs, "select count(*) from e_idle_active").await, "1");
+}
+
+#[tokio::test]
+async fn paused_result_expires_without_server_idle_timeout_and_keeps_fetched_rows() {
+    let mut h = H::with_timeout("nbq-e-idle-paused", false, Duration::from_millis(700)).await;
+    let mut obs = h.observer().await;
+    obs.execute("drop table if exists e_idle_paused").await.unwrap();
+    obs.execute("create table e_idle_paused (a int)").await.unwrap();
+    h.ok("insert into e_idle_paused values (1)").await;
+    h.ok("set idle_in_transaction_session_timeout = 0").await; // Exercise app-side protection alone.
+    let (q, events) = h.run("select i, repeat('x', 1000) from generate_series(1, 1000000) i").await;
+    h.paused_at(q).await;
+    let spool = spool_of(&events);
+    h.wait(|e| matches!(e, Event::TransactionExpired { .. }).then_some(())).await;
+    assert!(!h.txn.unwrap().in_txn);
+    assert!(matches!(spool.progress().status, SpoolStatus::Stopped(_)));
+    assert!(!spool.read(0..1).unwrap().is_empty());
+    no_backends(&mut *obs, "nbq-e-idle-paused").await;
+    assert_eq!(scalar(&mut *obs, "select count(*) from e_idle_paused").await, "0");
+}
+
+#[tokio::test]
+async fn redshift_mode_idle_cleanup_cancels_instead_of_draining_an_abandoned_result() {
+    let mut h = H::with_timeout("nbq-e-idle-redshift", false, Duration::from_millis(700)).await;
+    h.params.kind = nbq_driver::DbKind::Redshift;
+    h.engine.set_connection(h.tab, Some(h.params.clone()), false);
+    h.wait(|e| matches!(e, Event::Conn { state: ConnState::Connected, .. }).then_some(())).await;
+    let mut obs = h.observer().await;
+    let (q, events) = h.run("select i, repeat('x', 1000) from generate_series(1, 10000000) i").await;
+    h.paused_at(q).await;
+    let spool = spool_of(&events);
+    tokio::time::timeout(Duration::from_secs(4), h.wait(|e| matches!(e, Event::TransactionExpired { .. }).then_some(())))
+        .await.expect("idle cleanup tried to drain a Redshift result");
+    no_backends(&mut *obs, "nbq-e-idle-redshift").await;
+    assert!(matches!(spool.progress().status, SpoolStatus::Stopped(_)));
+}
+
+#[tokio::test]
+async fn abandoned_autocommit_result_releases_its_implicit_transaction() {
+    let mut h = H::with_timeout("nbq-e-idle-autocommit", true, Duration::from_millis(700)).await;
+    let mut obs = h.observer().await;
+    let (q, events) = h.run("select i, repeat('x', 1000) from generate_series(1, 10000000) i").await;
+    h.paused_at(q).await;
+    let spool = spool_of(&events);
+    h.wait(|e| matches!(e, Event::TransactionExpired { had_transaction: false, .. }).then_some(())).await;
+    no_backends(&mut *obs, "nbq-e-idle-autocommit").await;
+    assert!(matches!(spool.progress().status, SpoolStatus::Stopped(_)));
+    assert!(!spool.read(0..1).unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn server_idle_timeout_updates_transaction_state_without_another_query() {
+    let mut h = H::with_timeout("nbq-e-idle-server", false, Duration::from_secs(30)).await;
+    h.ok("select 1").await;
+    h.ok("set idle_in_transaction_session_timeout = '150ms'").await;
+    tokio::time::timeout(Duration::from_secs(3), h.wait(|e| matches!(e, Event::TransactionExpired { .. }).then_some(())))
+        .await.expect("UI state was not updated when the server terminated an idle transaction");
+    assert!(!h.txn.unwrap().in_txn);
+}
+
+#[tokio::test]
+async fn disconnect_cancels_a_running_query_and_rolls_back_the_transaction() {
+    let mut h = H::new("nbq-e-disconnect-txn", false).await;
+    let mut obs = h.observer().await;
+    obs.execute("drop table if exists e_disconnect_txn").await.unwrap();
+    obs.execute("create table e_disconnect_txn (a int)").await.unwrap();
+    h.ok("insert into e_disconnect_txn values (1)").await;
+    let query = h.engine.execute(h.tab, vec!["select pg_sleep(30)".into()]);
+    h.wait(|e| matches!(e, Event::StatementStarted { query: q, .. } if *q == query).then_some(())).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    h.engine.set_connection(h.tab, None, false);
+    tokio::time::timeout(Duration::from_secs(4), h.wait(|e| matches!(e, Event::Conn { state: ConnState::Disconnected, .. }).then_some(())))
+        .await.expect("disconnect waited for the running query");
+    assert!(!h.txn.unwrap().in_txn);
+    no_backends(&mut *obs, "nbq-e-disconnect-txn").await;
+    assert_eq!(scalar(&mut *obs, "select count(*) from e_disconnect_txn").await, "0");
+}
+
+#[tokio::test]
+async fn shutdown_waits_for_rollback_and_closes_tabs_and_metadata() {
+    let mut h = H::new("nbq-e-shutdown-txn", false).await;
+    let mut obs = h.observer().await;
+    obs.execute("drop table if exists e_shutdown_txn").await.unwrap();
+    obs.execute("create table e_shutdown_txn (a int)").await.unwrap();
+    h.ok("insert into e_shutdown_txn values (1)").await;
+    h.engine.connect_profile("c1", &h.params);
+    h.wait(|e| matches!(e, Event::MetadataConn { state: ConnState::Connected, .. }).then_some(())).await;
+    let second = h.engine.open_tab();
+    h.engine.set_connection(second, Some(h.params.clone()), true);
+    h.wait(|e| matches!(e, Event::Conn { tab, state: ConnState::Connected } if *tab == second).then_some(())).await;
+    let q = h.engine.execute(second, vec!["select pg_sleep(30)".into()]);
+    h.wait(|e| matches!(e, Event::StatementStarted { query, .. } if *query == q).then_some(())).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    h.engine.close_tab(second); // Shutdown must also wait for an already-closing tab.
+    tokio::time::timeout(Duration::from_secs(6), h.engine.shutdown()).await.unwrap().unwrap();
+    no_backends(&mut *obs, "nbq-e-shutdown-txn").await;
+    assert_eq!(scalar(&mut *obs, "select count(*) from e_shutdown_txn").await, "0");
 }

@@ -172,6 +172,8 @@ pub struct Settings {
     pub dark: bool,
     pub editor_font_size: f32,
     pub initial_rows: u64,
+    /// Roll back abandoned transactions after this many seconds without DB activity.
+    pub transaction_idle_timeout_secs: u64,
     pub csv_delimiter: char,
     pub csv_null: String,
     /// Blank lines separate statements for "run statement".
@@ -184,6 +186,7 @@ impl Default for Settings {
             dark: true,
             editor_font_size: 14.0,
             initial_rows: 500,
+            transaction_idle_timeout_secs: 15 * 60,
             csv_delimiter: ',',
             csv_null: String::new(),
             blank_line_delimits: true,

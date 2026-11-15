@@ -8,7 +8,7 @@ mod decode;
 mod tls;
 
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use arrow_array::builder::{
@@ -33,15 +33,31 @@ pub struct PgSession {
     client: Client,
     kind: DbKind,
     cancel: Arc<PgCancel>,
+    connection: ConnectionTask,
+}
+
+struct ConnectionTask {
+    join: tokio::task::JoinHandle<()>,
+    error: Arc<Mutex<Option<DriverError>>>,
+}
+
+impl Drop for ConnectionTask {
+    fn drop(&mut self) {
+        // A paused RowStream can retain a client handle. Owning the socket task
+        // ensures dropping the session still closes TCP and releases its txn.
+        self.join.abort();
+    }
 }
 
 struct PgCancel {
     token: CancelToken,
     tls: Option<tokio_postgres_rustls::MakeRustlsConnect>,
+    connection: tokio::task::AbortHandle,
 }
 
 #[async_trait]
 impl CancelHandle for PgCancel {
+    fn close_connection(&self) { self.connection.abort(); }
     async fn cancel(&self) -> Result<()> {
         let r = match &self.tls {
             Some(tls) => self.token.cancel_query(tls.clone()).await,
@@ -72,16 +88,14 @@ impl PgSession {
         let connect = async {
             if p.ssl == SslMode::Disable {
                 let (client, conn) = cfg.connect(tokio_postgres::NoTls).await?;
-                spawn_conn(conn);
-                Ok::<_, tokio_postgres::Error>((client, None))
+                Ok::<_, tokio_postgres::Error>((client, None, spawn_conn(conn)))
             } else {
                 let tls = connector.expect("TLS enabled");
                 let (client, conn) = cfg.connect(tls.clone()).await?;
-                spawn_conn(conn);
-                Ok((client, Some(tls)))
+                Ok((client, Some(tls), spawn_conn(conn)))
             }
         };
-        let (client, tls) = tokio::time::timeout(p.connect_timeout + Duration::from_secs(1), connect)
+        let (client, tls, connection) = tokio::time::timeout(p.connect_timeout + Duration::from_secs(1), connect)
             .await
             .map_err(|_| DriverError::connection("connection timed out"))?
             .map_err(|e| {
@@ -89,20 +103,26 @@ impl PgSession {
                 d.kind = ErrorKind::Connection;
                 d
             })?;
-        let cancel = Arc::new(PgCancel { token: client.cancel_token(), tls });
-        Ok(PgSession { client, kind: p.kind, cancel })
+        let cancel = Arc::new(PgCancel { token: client.cancel_token(), tls, connection: connection.join.abort_handle() });
+        Ok(PgSession { client, kind: p.kind, cancel, connection })
     }
 }
 
-fn spawn_conn<F>(conn: F)
+fn spawn_conn<F>(conn: F) -> ConnectionTask
 where
     F: std::future::Future<Output = std::result::Result<(), tokio_postgres::Error>> + Send + 'static,
 {
-    tokio::spawn(async move {
+    let error = Arc::new(Mutex::new(None));
+    let output = error.clone();
+    let join = tokio::spawn(async move {
         if let Err(e) = conn.await {
             tracing::debug!("postgres connection closed: {e}");
+            let mut e = map_err(e);
+            e.kind = ErrorKind::Connection;
+            *output.lock().unwrap() = Some(e);
         }
     });
+    ConnectionTask { join, error }
 }
 
 pub(crate) fn map_err(e: tokio_postgres::Error) -> DriverError {
@@ -135,7 +155,7 @@ pub(crate) fn map_err(e: tokio_postgres::Error) -> DriverError {
 
 fn sqlstate_kind(code: &str) -> ErrorKind {
     if code == "57014" { ErrorKind::Cancelled }
-    else if code.starts_with("08") || matches!(code, "57P01" | "57P02" | "57P03") { ErrorKind::Connection }
+    else if code.starts_with("08") || matches!(code, "57P01" | "57P02" | "57P03" | "25P03" | "25P04") { ErrorKind::Connection }
     else { ErrorKind::Query }
 }
 
@@ -144,7 +164,7 @@ mod connection_tests {
     use super::*;
     #[test]
     fn fatal_server_errors_require_a_new_session() {
-        for code in ["08006", "08003", "57P01", "57P02", "57P03"] { assert_eq!(sqlstate_kind(code), ErrorKind::Connection); }
+        for code in ["08006", "08003", "57P01", "57P02", "57P03", "25P03", "25P04"] { assert_eq!(sqlstate_kind(code), ErrorKind::Connection); }
         assert_eq!(sqlstate_kind("57014"), ErrorKind::Cancelled);
         assert_eq!(sqlstate_kind("23505"), ErrorKind::Query);
     }
@@ -179,6 +199,26 @@ impl Session for PgSession {
 
     fn is_closed(&self) -> bool {
         self.client.is_closed()
+    }
+
+    fn closed_error(&self) -> Option<DriverError> {
+        self.connection.error.lock().unwrap().clone()
+    }
+
+    async fn configure_transaction_timeout(&mut self, timeout: Duration) -> Result<Duration> {
+        if self.kind != DbKind::Postgres { return Ok(timeout); }
+        let rows = self.client.query(
+            "SELECT setting::bigint FROM pg_catalog.pg_settings WHERE name = 'idle_in_transaction_session_timeout'", &[]
+        ).await.map_err(map_err)?;
+        let Some(row) = rows.first() else { return Ok(timeout) }; // Older PostgreSQL: app-side protection still applies.
+        let existing: i64 = row.get(0);
+        let requested = timeout.as_millis().clamp(1, i32::MAX as u128) as i64;
+        let effective = if existing > 0 { existing.min(requested) } else { requested };
+        let value = format!("{effective}ms");
+        self.client.query_one(
+            "SELECT pg_catalog.set_config('idle_in_transaction_session_timeout', $1, false)", &[&value]
+        ).await.map_err(map_err)?;
+        Ok(Duration::from_millis(effective as u64))
     }
 
     async fn execute(&mut self, sql: &str) -> Result<Execution> {

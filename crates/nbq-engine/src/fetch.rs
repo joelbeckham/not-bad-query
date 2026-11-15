@@ -108,6 +108,7 @@ impl FetchTask {
                     break;
                 }
                 if !reported_pause {
+                    self.shared.set_fetching(false);
                     self.emit_progress(true);
                     reported_pause = true;
                 }
@@ -127,7 +128,10 @@ impl FetchTask {
                 want.saturating_sub(spool.rows()).clamp(256, 8192)
             } as usize;
             let deadline = Duration::from_millis(if first { 100 } else { 250 });
-            match self.stream.next_batch(max, deadline).await {
+            self.shared.set_fetching(true);
+            let batch = self.stream.next_batch(max, deadline).await;
+            self.shared.set_fetching(false);
+            match batch {
                 Ok(Some(b)) => {
                     if !discard {
                         let target = spool.clone();

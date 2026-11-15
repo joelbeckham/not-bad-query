@@ -176,6 +176,9 @@ pub trait RowStream: Send {
 #[async_trait]
 pub trait CancelHandle: Send + Sync {
     async fn cancel(&self) -> Result<()>;
+    /// Terminal fallback: close the owning socket if protocol cancellation or
+    /// graceful shutdown cannot complete. Never used for ordinary query Stop.
+    fn close_connection(&self) {}
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -194,6 +197,11 @@ pub trait Session: Send {
     /// this by closing streams before issuing new statements.
     async fn execute(&mut self, sql: &str) -> Result<Execution>;
     fn is_closed(&self) -> bool;
+    /// Last asynchronous connection error, if the driver can report it.
+    fn closed_error(&self) -> Option<DriverError> { None }
+    /// Install a server-side idle-transaction backstop where supported. Return
+    /// the effective limit, preserving a shorter administrator-supplied limit.
+    async fn configure_transaction_timeout(&mut self, timeout: Duration) -> Result<Duration> { Ok(timeout) }
 }
 
 /// Open a session for `params`.

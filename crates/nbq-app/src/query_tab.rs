@@ -32,6 +32,7 @@ pub enum Status {
     Done { message: String, elapsed: Duration },
     Failed { error: DriverError, elapsed: Duration },
     Cancelled { elapsed: Duration },
+    Notice(String),
 }
 
 pub struct QueryTab {
@@ -161,7 +162,6 @@ impl QueryTab {
 
     /// Keep the script and its selected profile, but release its live session.
     pub fn disconnect(&mut self, cx: &mut Context<Self>) {
-        if self.txn.in_txn || self.is_running() { return; }
         self.session_enabled = false;
         self.conn_state = ConnState::Disconnected;
         self.engine.set_connection(self.engine_tab, None, self.txn.autocommit);
@@ -379,6 +379,16 @@ impl QueryTab {
                 self.conn_state = state;
             }
             Event::Txn { state, .. } => self.txn = state,
+            Event::TransactionExpired { idle_for, had_transaction, .. } => {
+                let seconds = idle_for.as_secs().max(1);
+                let (amount, unit) = if seconds >= 60 { (seconds.saturating_add(30) / 60, "minute") } else { (seconds, "second") };
+                let duration = format!("{amount} {unit}{}", if amount == 1 { "" } else { "s" });
+                let action = if had_transaction { "Transaction rolled back" } else { "Paused result closed" };
+                let detail = if had_transaction { "Uncommitted changes were discarded." } else { "Fetched rows remain available." };
+                let message = format!("{action} after {duration} without database activity. {detail}");
+                window.push_notification(gpui_kit::component::notification::Notification::warning(message.clone()), cx);
+                self.status = Status::Notice(format!("{action} after {duration} of inactivity"));
+            }
             Event::StatementStarted { .. } => {}
             Event::ResultOpened { query, spool, .. } => {
                 self.fetch = None;
@@ -653,6 +663,10 @@ impl QueryTab {
                     .child("Cancelled")
                     .child(div().text_color(theme.muted_foreground).child(fmt_elapsed(*elapsed)));
             }
+            Status::Notice(message) => {
+                left = left.child(Icon::new(IconName::CircleAlert).small().text_color(theme.warning))
+                    .child(div().text_color(theme.warning).child(message.clone()));
+            }
         }
         let export_label = match &self.export {
             Some((_, rows, None)) => Some(format!("Exporting… {}", fmt_count(*rows))),
@@ -711,7 +725,7 @@ impl Render for QueryTab {
             let g = self.grid.read(cx).delegate();
             g.has_result()
                 && error.is_none()
-                && matches!(self.status, Status::Rows { .. } | Status::Running)
+                && matches!(self.status, Status::Rows { .. } | Status::Running | Status::Notice(_))
         };
         let results = v_flex()
             .size_full()

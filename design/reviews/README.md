@@ -35,6 +35,33 @@ and regeneration instructions are in `../../crates/nbq-app/assets/README.md`.
 
 ## Claude review status: pending access
 
+### Transaction inactivity and cleanup — 2026-11-14
+
+- `transaction-idle-expired.png`: the local sample-project preview used a
+  three-second test limit. An uncommitted INSERT RETURNING was rolled back; its
+  returned row remains visible alongside the warning and persistent status text.
+  The production default is 900 seconds (15 minutes).
+- `transaction-disconnect-confirmation.png`: the pending-write indicator remains
+  visible behind the explicit Disconnect and roll back confirmation.
+- `transaction-quit-confirmation.png`: the existing quit guard with a live,
+  uncommitted transaction; the window now waits for engine cleanup before exit.
+
+Native checks verified that Keep connected preserves the transaction, confirmed
+Disconnect leaves zero application sessions and zero committed test rows, and
+confirmed Quit exits successfully with zero sessions and zero committed test
+rows. The fixture table was removed after verification. The three-second limit
+was isolated under `target/transaction-review`; user settings were not changed.
+
+All 116 workspace tests and five startup smoke cases pass. Coverage includes
+session-local PostgreSQL timeout configuration, stricter server limits, idle
+rollback and reconnect, activity resets, long-running queries, paused manual and
+auto-commit results, Redshift-mode terminal cancellation, retained result streams,
+running-query disconnect and shutdown of tabs plus metadata sessions.
+
+A fresh read-only Claude screenshot review failed before image inspection with
+the same organization-access error below. Codex inspected these native images;
+Claude visual sign-off remains pending access.
+
 ### Results scrolling stability — 2026-11-14
 
 - `grid-scroll-before.png`: reproduced repeated `…` placeholders after scrolling

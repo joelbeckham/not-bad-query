@@ -40,7 +40,8 @@ nbq-app (GPUI views)  ──commands──▶  nbq-engine (tokio runtime)
   Connect opens the browser session and retries disconnected/failed tabs.
   Disconnect releases all of the profile's sessions and cancels pending connects,
   retaining scripts, their selected profiles, and already-fetched result rows.
-  Running queries and open transactions must be resolved first. Running SQL again
+  Disconnect asks before cancelling running queries and rolling back open
+  transactions. Running SQL again
   reconnects the tab. Metadata retirement cancels queued/in-flight introspection
   and suppresses stale events so disconnected caches cannot reappear.
 
@@ -77,7 +78,8 @@ A result opens with `initial_rows` (500) fetched. After that the fetch task stop
 polling the driver stream until the grid asks for more (`ensure_rows` + lookahead).
 For Postgres an unpolled `tokio_postgres::RowStream` makes the connection stop reading
 the socket, so the backend blocks in `ClientWrite`: the result is paused **on the server**
-with no cursor and no transaction (verified in `nbq-driver/tests/pg.rs`).
+without an explicit cursor. Even in auto-commit, an unfinished SELECT can retain
+its implicit statement transaction until completion or cancellation.
 
 * Statements that write (incl. `UPDATE ... RETURNING`) and all but the last statement
   of a script are always drained to completion.
@@ -101,6 +103,35 @@ with no cursor and no transaction (verified in `nbq-driver/tests/pg.rs`).
   changing connections or commit mode. Closing a window with unsaved scripts or
   pending work asks before discarding it. Closing a tab cancels execution before
   its session actor shuts down and rolls back.
+* Open transactions expire after **15 minutes without database activity**.
+  Configure `transaction_idle_timeout_secs = 900` in the app's `settings.toml`
+  (restart to apply; values below one second are clamped to one second). Running
+  statements and active result fetching are not idle; new statements and actual
+  fetch demand reset the timer. Editing SQL or reading cached rows does not.
+  An abandoned paused auto-commit result also expires, releasing its implicit
+  statement transaction while keeping already-fetched rows available.
+* PostgreSQL sessions set `idle_in_transaction_session_timeout` to this limit,
+  preserving a shorter existing server/role/database limit. This is per session;
+  no role, database or cluster defaults are changed. The server closes the expired
+  connection and rolls back its transaction, including if the app is no longer
+  responsive. `transaction_timeout` (PostgreSQL 17+) limits total transaction age,
+  including active queries; it is deliberately not set for this inactivity policy.
+  See [PostgreSQL timeout documentation](https://www.postgresql.org/docs/current/runtime-config-client.html).
+* An engine timer also closes abandoned paused results (which can leave the
+  server in `ClientWrite`, outside the server's idle-transaction timeout), and
+  supplies protection for Redshift. It cancels a terminal result, attempts bounded
+  rollback, closes the owning socket, clears transaction state and notifies the UI.
+  Async connection errors are observed locally without heartbeat SQL, so polling
+  cannot keep an idle transaction alive. Fatal timeout SQLSTATEs `25P03` / `25P04`
+  invalidate the session. Reconnection does not replay discarded writes.
+* Disconnect with pending work asks for **Disconnect and roll back**, then stops
+  execution and releases all sessions for that profile. Confirmed window close
+  waits for engine cleanup, including already-closing tabs and metadata sessions,
+  before removing the window. Per-session cancellation/socket deadlines prevent
+  a broken connection from hanging shutdown. Each PostgreSQL session owns its
+  socket task, so a retained result stream cannot keep its transaction alive after
+  session drop. PostgreSQL itself rolls back any open transaction when a session
+  terminates ([protocol documentation](https://www.postgresql.org/docs/current/protocol-flow.html)).
 
 ## TLS and scripts
 

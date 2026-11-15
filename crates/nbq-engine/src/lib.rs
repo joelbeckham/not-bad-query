@@ -13,7 +13,7 @@ mod tab;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use nbq_driver::{ConnectParams, DriverError};
@@ -38,13 +38,18 @@ pub struct EngineOptions {
     pub initial_rows: u64,
     /// Extra rows fetched beyond what the grid asked for.
     pub lookahead_rows: u64,
+    /// Maximum inactivity in an open transaction, including paused results.
+    pub transaction_idle_timeout: Duration,
     /// Clones share aggregate disk and decoded-cache budgets.
     pub spool_limits: nbq_results::SpoolLimits,
 }
 
 impl EngineOptions {
     pub fn new(spool_dir: PathBuf) -> Self {
-        EngineOptions { spool_dir, initial_rows: 500, lookahead_rows: 2000, spool_limits: Default::default() }
+        EngineOptions {
+            spool_dir, initial_rows: 500, lookahead_rows: 2000, spool_limits: Default::default(),
+            transaction_idle_timeout: Duration::from_secs(15 * 60),
+        }
     }
 }
 
@@ -80,6 +85,8 @@ pub enum Event {
     /// Status of the dedicated object-browser session for a profile.
     MetadataConn { conn: String, state: ConnState },
     Txn { tab: TabId, state: TxnState },
+    /// The session was closed and its transaction rolled back after inactivity.
+    TransactionExpired { tab: TabId, idle_for: Duration, had_transaction: bool },
     /// A statement started executing (the running timer starts here).
     StatementStarted { tab: TabId, query: QueryId, index: usize, sql: String, at: Instant },
     /// A statement that returns rows; the spool fills as rows are fetched.
@@ -101,6 +108,21 @@ pub enum Event {
 struct TabEntry {
     cmd: mpsc::UnboundedSender<Cmd>,
     shared: Arc<TabShared>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+async fn close_entry(mut tab: TabEntry) {
+    tab.shared.change_connection();
+    let shared = tab.shared.clone();
+    let cancel = tokio::spawn(async move { shared.terminate().await });
+    let _ = tab.cmd.send(Cmd::Shutdown);
+    if tokio::time::timeout(Duration::from_secs(5), &mut tab.task).await.is_err() {
+        // A broken network must not keep shutdown alive indefinitely. Dropping
+        // the actor's owning driver session closes its socket and transaction.
+        tab.task.abort();
+        let _ = tab.task.await;
+    }
+    cancel.abort();
 }
 
 pub struct Engine {
@@ -110,6 +132,8 @@ pub struct Engine {
     tabs: Mutex<HashMap<TabId, TabEntry>>,
     next_id: AtomicU64,
     meta: Arc<MetaPool>,
+    closing: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    shutting_down: AtomicBool,
 }
 
 impl Engine {
@@ -122,7 +146,10 @@ impl Engine {
             .expect("tokio runtime");
         clean_spool_dir(&opts.spool_dir);
         let (tx, rx) = mpsc::unbounded_channel();
-        let e = Arc::new(Engine { rt: Some(rt), events: tx, opts, tabs: Mutex::new(HashMap::new()), next_id: AtomicU64::new(1), meta: Default::default() });
+        let e = Arc::new(Engine {
+            rt: Some(rt), events: tx, opts, tabs: Mutex::new(HashMap::new()), next_id: AtomicU64::new(1),
+            meta: Default::default(), closing: Default::default(), shutting_down: AtomicBool::new(false),
+        });
         (e, rx)
     }
 
@@ -136,11 +163,12 @@ impl Engine {
 
     pub fn open_tab(&self) -> TabId {
         let id = TabId(self.id());
+        if self.shutting_down.load(Ordering::Acquire) { return id; }
         let (tx, rx) = mpsc::unbounded_channel();
         let shared = Arc::new(TabShared::default());
         let actor = tab::TabActor::new(id, rx, shared.clone(), self.events.clone(), self.opts.clone());
-        self.rt().spawn(actor.run());
-        self.tabs.lock().insert(id, TabEntry { cmd: tx, shared });
+        let task = self.rt().spawn(actor.run());
+        self.tabs.lock().insert(id, TabEntry { cmd: tx, shared, task });
         id
     }
 
@@ -153,16 +181,37 @@ impl Engine {
     /// Close a tab. An open transaction is rolled back.
     pub fn close_tab(&self, tab: TabId) {
         if let Some(t) = self.tabs.lock().remove(&tab) {
-            t.shared.change_connection();
-            self.rt().spawn(async move { t.shared.cancel().await });
-            let _ = t.cmd.send(Cmd::Shutdown);
+            let mut closing = self.closing.lock();
+            closing.retain(|task| !task.is_finished());
+            closing.push(self.rt().spawn(close_entry(t)));
         }
+    }
+
+    /// Start bounded cleanup on the engine runtime. UI callers await the
+    /// acknowledgement without blocking GPUI before removing the final window.
+    pub fn shutdown(&self) -> tokio::sync::oneshot::Receiver<()> {
+        self.shutting_down.store(true, Ordering::Release);
+        let tabs: Vec<_> = self.tabs.lock().drain().map(|(_, tab)| tab).collect();
+        let mut closing = std::mem::take(&mut *self.closing.lock());
+        for tab in tabs { closing.push(self.rt().spawn(close_entry(tab))); }
+        let metadata = self.meta.retire_all();
+        let (done, rx) = tokio::sync::oneshot::channel();
+        self.rt().spawn(async move {
+            for conn in metadata { conn.close().await; }
+            for task in closing { let _ = task.await; }
+            let _ = done.send(());
+        });
+        rx
     }
 
     /// Point a tab at a connection (or none). Connects eagerly in the
     /// background. Any open transaction on the previous connection is rolled back.
     pub fn set_connection(&self, tab: TabId, params: Option<ConnectParams>, autocommit: bool) {
         if let Some(t) = self.tabs.lock().get(&tab) {
+            if params.is_none() {
+                let shared = t.shared.clone();
+                self.rt().spawn(async move { shared.terminate().await });
+            }
             let revision = t.shared.change_connection();
             let _ = t.cmd.send(Cmd::SetConnection { params, autocommit, revision });
         }
@@ -206,6 +255,7 @@ impl Engine {
 
     /// List the children of `path` in the object tree of connection `conn`.
     pub fn load_objects(&self, conn: &str, params: &ConnectParams, path: ObjPath) {
+        if self.shutting_down.load(Ordering::Acquire) { return; }
         let mc = self.meta.get(conn, params, &self.events);
         let conn = conn.to_string();
         self.rt().spawn(async move {
@@ -217,6 +267,7 @@ impl Engine {
 
     /// Load every relation and its columns (for autocomplete).
     pub fn load_catalog(&self, conn: &str, params: &ConnectParams) {
+        if self.shutting_down.load(Ordering::Acquire) { return; }
         let mc = self.meta.get(conn, params, &self.events);
         let conn = conn.to_string();
         self.rt().spawn(async move {
@@ -228,6 +279,7 @@ impl Engine {
 
     /// Connect the object browser without opening a query tab.
     pub fn connect_profile(&self, conn: &str, params: &ConnectParams) {
+        if self.shutting_down.load(Ordering::Acquire) { return; }
         let mc = self.meta.get(conn, params, &self.events);
         self.rt().spawn(async move { mc.until_retired(mc.connect()).await; });
     }

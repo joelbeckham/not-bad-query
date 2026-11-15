@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use nbq_driver::{CancelHandle, ConnectParams, DriverError, ErrorKind, Execution, Session};
 use nbq_results::Spool;
@@ -42,6 +42,8 @@ struct SharedInner {
     /// A statement is executing (not merely a paused result).
     running: bool,
     fetch: Option<FetchCtl>,
+    fetching: bool,
+    last_activity: Option<Instant>,
 }
 
 impl TabShared {
@@ -51,7 +53,46 @@ impl TabShared {
     }
 
     pub fn set_running(&self, running: bool) {
-        self.inner.lock().running = running;
+        let mut inner = self.inner.lock();
+        inner.running = running;
+        inner.last_activity = Some(Instant::now());
+    }
+
+    pub fn set_fetching(&self, fetching: bool) {
+        let mut inner = self.inner.lock();
+        if inner.fetching != fetching {
+            inner.fetching = fetching;
+            inner.last_activity = Some(Instant::now());
+        }
+    }
+
+    fn touch(&self) { self.inner.lock().last_activity = Some(Instant::now()); }
+
+    fn idle_for(&self) -> Option<Duration> {
+        let inner = self.inner.lock();
+        if inner.running || inner.fetching { return None; }
+        inner.last_activity.map(|at| at.elapsed())
+    }
+
+    /// Terminal cancellation may abort the whole transaction (including Redshift).
+    pub async fn force_cancel(&self) {
+        let handle = self.inner.lock().cancel.clone();
+        if let Some(handle) = handle {
+            let _ = tokio::time::timeout(Duration::from_secs(2), handle.cancel()).await;
+        }
+    }
+
+    /// Run outside the actor queue: even a stalled Execute must release its
+    /// socket promptly after an intentional disconnect/close.
+    pub async fn terminate(&self) {
+        let (handle, running) = { let inner = self.inner.lock(); (inner.cancel.clone(), inner.running) };
+        if let Some(handle) = handle {
+            if running {
+                let _ = tokio::time::timeout(Duration::from_secs(1), handle.cancel()).await;
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            handle.close_connection();
+        }
     }
 
     fn set_cancel(&self, c: Option<Arc<dyn CancelHandle>>) {
@@ -77,17 +118,20 @@ impl TabShared {
     }
 
     pub fn demand(&self, query: QueryId, rows: u64) {
-        let g = self.inner.lock();
+        let mut g = self.inner.lock();
+        let mut changed = false;
         if let Some(f) = g.fetch.as_ref().filter(|f| f.query == query) {
             f.demand.send_if_modified(|v| {
                 if rows > *v {
                     *v = rows;
+                    changed = true;
                     true
                 } else {
                     false
                 }
             });
         }
+        if changed { g.last_activity = Some(Instant::now()); }
     }
 }
 
@@ -110,6 +154,7 @@ pub(crate) struct TabActor {
     session: Option<Box<dyn Session>>,
     txn: TxnState,
     fetch: Option<ActiveFetch>,
+    idle_timeout: Duration,
 }
 
 const SAVEPOINT: &str = "SAVEPOINT nbq_sp";
@@ -124,6 +169,7 @@ impl TabActor {
         events: mpsc::UnboundedSender<Event>,
         opts: EngineOptions,
     ) -> Self {
+        let idle_timeout = opts.transaction_idle_timeout.max(Duration::from_millis(1));
         TabActor {
             id,
             rx,
@@ -135,6 +181,7 @@ impl TabActor {
             session: None,
             txn: TxnState { autocommit: true, in_txn: false, pending_writes: 0, since: None },
             fetch: None,
+            idle_timeout,
         }
     }
 
@@ -153,17 +200,19 @@ impl TabActor {
     }
 
     pub async fn run(mut self) {
-        while let Some(cmd) = self.rx.recv().await {
+        let mut poll = tokio::time::interval(self.idle_timeout.min(Duration::from_millis(250)).max(Duration::from_millis(10)));
+        poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            let cmd = tokio::select! {
+                biased;
+                cmd = self.rx.recv() => { let Some(cmd) = cmd else { break }; cmd },
+                _ = poll.tick() => { self.maintain().await; continue; }
+            };
             match cmd {
                 Cmd::SetConnection { params, autocommit, revision } => {
                     if revision != *self.shared.connection_revision.borrow() { continue; }
                     self.connection_revision = revision;
-                    self.close_fetch().await;
-                    if self.txn.in_txn {
-                        let _ = self.simple("ROLLBACK").await;
-                    }
-                    self.drop_session();
-                    self.reset_txn();
+                    self.terminate_session("disconnected").await;
                     self.txn.autocommit = autocommit;
                     self.params = params;
                     self.emit_txn();
@@ -182,6 +231,7 @@ impl TabActor {
                     self.emit_txn();
                 }
                 Cmd::Execute { query, statements } => {
+                    self.shared.touch();
                     self.execute(query, statements).await;
                     self.emit(Event::QueryDone { tab: self.id, query });
                 }
@@ -191,10 +241,63 @@ impl TabActor {
             }
         }
         // Tab closed: never leave a transaction or a paused query on the server.
-        self.close_fetch().await;
-        if self.txn.in_txn {
-            let _ = self.simple("ROLLBACK").await;
+        self.terminate_session("tab closed").await;
+    }
+
+    /// Check local state only: polling must not send keepalives that reset the
+    /// server's idle timeout. Paused ClientWrite results need the app timer.
+    async fn maintain(&mut self) {
+        if self.fetch.as_ref().is_some_and(|f| f.join.is_finished()) {
+            self.close_fetch().await;
         }
+        if self.session.as_ref().is_some_and(|s| s.is_closed()) {
+            let expired = self.session.as_ref().and_then(|s| s.closed_error())
+                .is_some_and(|e| e.code.as_deref() == Some("25P03"));
+            let error = self.session.as_ref().and_then(|s| s.closed_error())
+                .unwrap_or_else(|| DriverError::connection("Database connection closed; uncommitted changes were rolled back."));
+            let idle_for = self.shared.idle_for().unwrap_or(self.idle_timeout);
+            self.terminate_session("connection closed").await;
+            if expired {
+                self.emit(Event::Conn { tab: self.id, state: ConnState::Disconnected });
+                self.emit(Event::TransactionExpired { tab: self.id, idle_for, had_transaction: true });
+            } else {
+                self.emit(Event::Conn { tab: self.id, state: ConnState::Failed(error) });
+            }
+        } else if (self.txn.in_txn || self.fetch.as_ref().is_some_and(|f| f.ctl.is_open()))
+            && self.shared.idle_for().is_some_and(|idle| idle >= self.idle_timeout) {
+            let idle_for = self.shared.idle_for().unwrap_or(self.idle_timeout);
+            let had_transaction = self.txn.in_txn;
+            self.terminate_session("transaction idle timeout").await;
+            self.emit(Event::Conn { tab: self.id, state: ConnState::Disconnected });
+            self.emit(Event::TransactionExpired { tab: self.id, idle_for, had_transaction });
+        }
+    }
+
+    /// Terminal cleanup must not drain an abandoned Redshift result forever.
+    /// Cancel, attempt ROLLBACK with a deadline, then close the owning socket.
+    async fn terminate_session(&mut self, reason: &str) {
+        if let Some(fetch) = self.fetch.take() {
+            fetch.join.abort();
+            let _ = fetch.join.await;
+            if fetch.ctl.is_open() {
+                fetch.ctl.spool.finish(nbq_results::Status::Stopped(reason.into()));
+                if self.session.as_ref().is_some_and(|s| !s.is_closed()) {
+                    self.shared.force_cancel().await;
+                }
+            }
+            self.emit(Event::Fetch { tab: self.id, query: fetch.ctl.query, progress: fetch.ctl.spool.progress(), paused: false });
+        }
+        self.shared.set_fetch(None);
+        self.shared.set_fetching(false);
+        self.shared.set_running(false);
+        // Also flush cancellation and cover transactions opened by SQL forms
+        // the client has not classified. ROLLBACK outside a txn is harmless.
+        if self.session.as_ref().is_some_and(|s| !s.is_closed()) {
+            let _ = tokio::time::timeout(Duration::from_secs(2), self.simple("ROLLBACK")).await;
+        }
+        self.drop_session();
+        self.reset_txn();
+        self.emit_txn();
     }
 
     fn drop_session(&mut self) {
@@ -212,9 +315,25 @@ impl TabActor {
             result = nbq_driver::connect(&p) => result,
         };
         match result {
-            Ok(s) => {
+            Ok(mut s) => {
+                let configured = tokio::select! {
+                    biased;
+                    _ = revision.wait_for(|r| *r != self.connection_revision) => return false,
+                    result = tokio::time::timeout(p.connect_timeout,
+                        s.configure_transaction_timeout(self.opts.transaction_idle_timeout.max(Duration::from_millis(1)))) => {
+                        result.unwrap_or_else(|_| Err(DriverError::connection("Timed out configuring transaction inactivity protection.")))
+                    },
+                };
+                match configured {
+                    Ok(timeout) => self.idle_timeout = timeout,
+                    Err(error) => {
+                        self.emit(Event::Conn { tab: self.id, state: ConnState::Failed(error) });
+                        return false;
+                    }
+                }
                 self.shared.set_cancel(Some(s.cancel_handle()));
                 self.session = Some(s);
+                self.shared.touch();
                 self.emit(Event::Conn { tab: self.id, state: ConnState::Connected });
                 true
             }

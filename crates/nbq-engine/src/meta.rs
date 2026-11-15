@@ -468,6 +468,11 @@ impl MetaPool {
         c.retire();
         Some(c)
     }
+
+    pub fn retire_all(&self) -> Vec<Arc<MetaConn>> {
+        let mut conns = self.conns.lock();
+        conns.drain().map(|(_, conn)| { conn.retire(); conn }).collect()
+    }
 }
 
 pub(crate) fn send(events: &mpsc::UnboundedSender<Event>, e: Event) {

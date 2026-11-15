@@ -12,6 +12,36 @@ async fn session() -> Box<dyn Session> {
 }
 
 #[tokio::test]
+async fn idle_transaction_timeout_is_session_local_and_preserves_a_shorter_limit() {
+    let mut s = session().await;
+    s.execute("SET idle_in_transaction_session_timeout = 0").await.unwrap();
+    assert_eq!(s.configure_transaction_timeout(Duration::from_secs(900)).await.unwrap(), Duration::from_secs(900));
+    assert_eq!(scalar(&mut *s, "SELECT setting FROM pg_settings WHERE name = 'idle_in_transaction_session_timeout'").await.as_deref(), Some("900000"));
+    s.execute("SET idle_in_transaction_session_timeout = '120ms'").await.unwrap();
+    assert_eq!(s.configure_transaction_timeout(Duration::from_secs(900)).await.unwrap(), Duration::from_millis(120));
+    let mut other = session().await;
+    assert_eq!(scalar(&mut *other, "SELECT setting FROM pg_settings WHERE name = 'idle_in_transaction_session_timeout'").await.as_deref(), Some("0"));
+}
+
+#[tokio::test]
+async fn dropping_session_closes_socket_even_with_a_live_paused_stream() {
+    let mut p = tokio::task::spawn_blocking(nbq_testkit::pg).await.unwrap();
+    p.application_name = "nbq-driver-drop-session".into();
+    let mut s = connect(&p).await.unwrap();
+    let mut obs = session().await;
+    s.execute("BEGIN").await.unwrap();
+    let Execution::Rows(mut stream) = s.execute("select i, repeat('x', 1000) from generate_series(1, 1000000) i").await.unwrap() else { panic!("rows") };
+    stream.next_batch(10, Duration::from_secs(1)).await.unwrap();
+    drop(s); // The stream remains alive, but must not retain the backend socket.
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while scalar(&mut *obs, "select count(*) from pg_stat_activity where application_name = 'nbq-driver-drop-session'").await.as_deref() != Some("0") {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }).await.expect("live stream retained a session/transaction after disconnect");
+    drop(stream);
+}
+
+#[tokio::test]
 async fn wide_results_stop_at_the_batch_byte_target_and_reject_huge_values() {
     let mut s = session().await;
     let Execution::Rows(mut stream) = s.execute("select repeat('x', 65536) from generate_series(1, 100)").await.unwrap() else { panic!("rows") };

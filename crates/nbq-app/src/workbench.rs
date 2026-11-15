@@ -46,6 +46,7 @@ pub struct Workbench {
     /// A close that needs confirming (second Ctrl+W).
     close_armed: Option<EntityId>,
     quit_dialog_open: bool,
+    closing: bool,
     palette: Entity<CommandState>,
     focus: FocusHandle,
     _tasks: Vec<Task<()>>,
@@ -56,6 +57,7 @@ fn event_tab(ev: &Event) -> Option<TabId> {
     Some(match ev {
         Event::Conn { tab, .. }
         | Event::Txn { tab, .. }
+        | Event::TransactionExpired { tab, .. }
         | Event::StatementStarted { tab, .. }
         | Event::ResultOpened { tab, .. }
         | Event::StatementFinished { tab, .. }
@@ -110,6 +112,7 @@ impl Workbench {
 
         let mut opts = EngineOptions::new(Store::default_spool_dir());
         opts.initial_rows = settings.initial_rows;
+        opts.transaction_idle_timeout = Duration::from_secs(settings.transaction_idle_timeout_secs.max(1));
         let (engine, mut rx) = Engine::new(opts);
 
         let sidebar = cx.new(|cx| Sidebar::new(engine.clone(), projects.clone(), workspace.recent.clone(), cx));
@@ -148,6 +151,7 @@ impl Workbench {
             next_untitled: 1,
             close_armed: None,
             quit_dialog_open: false,
+            closing: false,
             palette,
             focus: cx.focus_handle(),
             _tasks: vec![events, watch],
@@ -174,12 +178,14 @@ impl Workbench {
     }
 
     fn request_close(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.closing { return false; }
         if self.tabs.iter().any(|tab| tab.read(cx).saving) {
             error(window, cx, "Wait for the script save to finish before closing.");
             return false;
         }
         if !self.tabs.iter().any(|tab| { let (dirty, pending) = self.tab_risk(tab, cx); dirty || pending }) {
-            return true;
+            self.begin_shutdown(window, cx);
+            return false;
         }
         if self.quit_dialog_open { return false; }
         self.quit_dialog_open = true;
@@ -200,16 +206,22 @@ impl Workbench {
                             error(window, cx, "Wait for the script save to finish before closing.");
                             return;
                         }
-                        for tab in &wb.tabs {
-                            let id = tab.read(cx).engine_tab;
-                            wb.engine.close_tab(id);
-                        }
-                        window.remove_window();
+                        wb.begin_shutdown(window, cx);
                     });
                     true
                 })
         });
         false
+    }
+
+    fn begin_shutdown(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.closing { return; }
+        self.closing = true;
+        let done = self.engine.shutdown();
+        cx.spawn_in(window, async move |this, cx| {
+            let _ = done.await;
+            let _ = this.update_in(cx, |_, window, _| window.remove_window());
+        }).detach();
     }
 
     fn with_active(&self, cx: &mut Context<Self>, f: impl FnOnce(&mut QueryTab, &mut Context<QueryTab>)) {
@@ -305,6 +317,7 @@ impl Workbench {
     }
 
     fn on_event(&mut self, ev: Event, window: &mut Window, cx: &mut Context<Self>) {
+        if self.closing { return; }
         match ev {
             Event::MetadataConn { conn, state } => {
                 self.sidebar.update(cx, |s, cx| s.on_metadata_state(conn, state, cx));
@@ -345,6 +358,7 @@ impl Workbench {
     }
 
     fn on_sidebar(&mut self, ev: &SidebarEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.closing { return; }
         match ev {
             SidebarEvent::Connect(key) => {
                 let Some(c) = connection(&self.projects.borrow(), key) else { return };
@@ -361,20 +375,28 @@ impl Workbench {
                 }
             }
             SidebarEvent::Disconnect(key) => {
-                let tabs: Vec<_> = self.tabs.iter().filter(|t| {
-                    t.read(cx).conn.as_ref().is_some_and(|c| c.key() == *key)
-                }).cloned().collect();
-                if tabs.iter().any(|t| { let t = t.read(cx); t.txn.in_txn || t.is_running() }) {
-                    window.push_notification(Notification::warning(
-                        "Finish or cancel queries, then commit or roll back open transactions before disconnecting this connection."
-                    ), cx);
-                    return;
+                let pending = self.tabs.iter().any(|tab| {
+                    let t = tab.read(cx);
+                    t.conn.as_ref().is_some_and(|c| c.key() == *key) && (t.txn.in_txn || t.is_running())
+                });
+                if pending {
+                    let title = connection(&self.projects.borrow(), key).map(|c| c.name).unwrap_or_default();
+                    let (key, owner) = (key.clone(), cx.weak_entity());
+                    window.open_dialog(cx, move |dialog, _, _| {
+                        let (key, owner) = (key.clone(), owner.clone());
+                        dialog.title(format!("Disconnect {title}?"))
+                            .child("Running queries will stop and all open transactions for this connection will roll back. Scripts and fetched rows will stay open.")
+                            .footer(DialogFooter::new()
+                                .child(DialogClose::new().child(Button::new("keep-connected").outline().label("Keep connected")))
+                                .child(DialogAction::new().child(Button::new("disconnect-rollback").danger().label("Disconnect and roll back"))))
+                            .on_ok(move |_, _, cx| {
+                                let _ = owner.update(cx, |wb, cx| wb.disconnect_connection(&key, cx));
+                                true
+                            })
+                    });
+                } else {
+                    self.disconnect_connection(key, cx);
                 }
-                for tab in tabs { tab.update(cx, |t, cx| t.disconnect(cx)); }
-                self.engine.forget_connection(key);
-                self.catalogs.borrow_mut().remove(key);
-                self.sidebar.update(cx, |s, cx| s.disconnect(key, cx));
-                cx.notify();
             }
             SidebarEvent::OpenConnection(key) => {
                 let c = connection(&self.projects.borrow(), key);
@@ -446,6 +468,18 @@ impl Workbench {
     }
 
     // ---- projects ----
+
+    fn disconnect_connection(&mut self, key: &str, cx: &mut Context<Self>) {
+        for tab in &self.tabs {
+            if tab.read(cx).conn.as_ref().is_some_and(|c| c.key() == key) {
+                tab.update(cx, |t, cx| t.disconnect(cx));
+            }
+        }
+        self.engine.forget_connection(key);
+        self.catalogs.borrow_mut().remove(key);
+        self.sidebar.update(cx, |s, cx| s.disconnect(key, cx));
+        cx.notify();
+    }
 
     fn save_workspace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Err(e) = self.store.save_workspace(&self.workspace) {
