@@ -4,6 +4,7 @@
 //! display strings. Scrolling near the end of what has been fetched asks the
 //! engine for more rows.
 
+use std::collections::VecDeque;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -16,8 +17,71 @@ use nbq_engine::{Engine, QueryId, Spool, TabId};
 
 /// Longest text shown in a cell; the full value is still in the spool.
 const MAX_CELL_CHARS: usize = 300;
-/// Rows decoded around the visible range.
-const WINDOW_MARGIN: usize = 150;
+// Small, aligned tiles let neighboring pages and columns coexist. Keep both
+// text and entry counts bounded, including results full of empty/null cells.
+const PREVIEW_ROWS: usize = 32;
+const PREVIEW_COLS: usize = 16;
+const PREVIEW_BYTES: usize = 4 * 1024 * 1024;
+const PREVIEW_TILES: usize = 64;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PreviewRange {
+    rows: Range<usize>,
+    cols: Range<usize>,
+}
+
+struct PreviewTile {
+    range: PreviewRange,
+    cells: Vec<Vec<Option<SharedString>>>,
+}
+
+impl PreviewTile {
+    fn cell(&self, row: usize, col: usize) -> Option<&Option<SharedString>> {
+        self.cells.get(row.checked_sub(self.range.rows.start)?)?.get(col.checked_sub(self.range.cols.start)?)
+    }
+
+    fn bytes(&self) -> usize {
+        std::mem::size_of::<Self>() + self.cells.capacity() * std::mem::size_of::<Vec<Option<SharedString>>>()
+            + self.cells.iter().map(|row| {
+                row.capacity() * std::mem::size_of::<Option<SharedString>>()
+                    + row.iter().flatten().map(|text| text.len()).sum::<usize>()
+            }).sum::<usize>()
+    }
+}
+
+#[derive(Default)]
+struct PreviewCache {
+    tiles: VecDeque<PreviewTile>,
+    bytes: usize,
+}
+
+impl PreviewCache {
+    fn cell(&self, row: usize, col: usize) -> Option<Option<SharedString>> {
+        self.tiles.iter().rev().find_map(|tile| tile.cell(row, col)).cloned()
+    }
+
+    fn insert(&mut self, tile: PreviewTile, visible: &PreviewRange) {
+        self.tiles.retain(|old| old.range.rows.start != tile.range.rows.start || old.range.cols.start != tile.range.cols.start);
+        // Preserve current viewport tiles ahead of older/off-screen pages.
+        let mut on_screen = VecDeque::new();
+        let mut off_screen = VecDeque::new();
+        for old in self.tiles.drain(..) {
+            if old.range.rows.start < visible.rows.end && old.range.rows.end > visible.rows.start
+                && old.range.cols.start < visible.cols.end && old.range.cols.end > visible.cols.start {
+                on_screen.push_back(old);
+            } else {
+                off_screen.push_back(old);
+            }
+        }
+        off_screen.append(&mut on_screen);
+        self.tiles = off_screen;
+        self.tiles.push_back(tile);
+        self.bytes = self.tiles.iter().map(PreviewTile::bytes).sum();
+        while self.bytes > PREVIEW_BYTES || self.tiles.len() > PREVIEW_TILES {
+            self.bytes -= self.tiles.pop_front().unwrap().bytes();
+        }
+    }
+}
 
 #[derive(Clone)]
 struct Col {
@@ -34,14 +98,12 @@ pub struct ResultGrid {
     cols: Vec<Col>,
     /// Rows available in the spool (refreshed on fetch events).
     rows: usize,
-    win_start: usize,
-    col_start: usize,
-    win: Vec<Vec<Option<SharedString>>>,
+    preview: PreviewCache,
+    visible: PreviewRange,
     /// Rows the grid has asked the engine for.
     requested: u64,
     generation: u64,
     loading: bool,
-    wanted: (usize, usize),
     load_error: Option<String>,
 }
 
@@ -54,13 +116,11 @@ impl ResultGrid {
             spool: None,
             cols: Vec::new(),
             rows: 0,
-            win_start: 0,
-            col_start: 0,
-            win: Vec::new(),
+            preview: PreviewCache::default(),
+            visible: PreviewRange { rows: 0..0, cols: 0..0 },
             requested: 0,
             generation: 0,
             loading: false,
-            wanted: (0, 0),
             load_error: None,
         }
     }
@@ -79,12 +139,11 @@ impl ResultGrid {
         self.rows = spool.rows() as usize;
         self.spool = Some(spool);
         self.query = Some(query);
-        self.win.clear();
-        self.win_start = 0;
+        self.preview = PreviewCache::default();
+        self.visible = PreviewRange { rows: 0..0, cols: 0..self.cols.len().min(PREVIEW_COLS) };
         self.requested = 0;
         self.generation = self.generation.wrapping_add(1);
         self.loading = false;
-        self.wanted = (0, 0);
         self.load_error = None;
     }
 
@@ -92,10 +151,8 @@ impl ResultGrid {
     pub fn refresh_rows(&mut self) -> bool {
         let n = self.spool.as_ref().map(|s| s.rows() as usize).unwrap_or(0);
         let old = std::mem::replace(&mut self.rows, n);
-        // A window that reached the old end was cut short; reload it.
-        if n != old && self.win_start + self.win.len() >= old {
-            self.win.clear();
-        }
+        // Spool rows are immutable. Keep populated cells while a partial tile
+        // at the old end is extended in the background.
         n != old
     }
 
@@ -107,17 +164,48 @@ impl ResultGrid {
         self.spool.is_some()
     }
 
-    fn load_window(&mut self, row: usize, col: usize, cx: &mut Context<TableState<Self>>) {
-        self.wanted = (row, col);
+    /// Seed/recheck previews after a result replacement or append, even if the
+    /// table's visible-range callbacks do not fire (the range can be unchanged).
+    pub fn prepare_preview(&mut self, rows: Range<usize>, cols: Range<usize>, cx: &mut Context<TableState<Self>>) {
+        self.visible = PreviewRange {
+            rows: if rows.is_empty() { 0..self.rows.min(PREVIEW_ROWS) } else { rows },
+            cols: if cols.is_empty() { 0..self.cols.len().min(PREVIEW_COLS) } else { cols },
+        };
+        self.load_visible(cx);
+    }
+
+    fn next_preview(&self) -> Option<PreviewRange> {
+        let rows = self.visible.rows.start..self.visible.rows.end.min(self.rows);
+        let cols = self.visible.cols.start..self.visible.cols.end.min(self.cols.len());
+        if rows.is_empty() || cols.is_empty() { return None; }
+        let row_start = rows.start / PREVIEW_ROWS * PREVIEW_ROWS;
+        let col_start = cols.start / PREVIEW_COLS * PREVIEW_COLS;
+        for row in (row_start..rows.end).step_by(PREVIEW_ROWS) {
+            for col in (col_start..cols.end).step_by(PREVIEW_COLS) {
+                let end_row = (row + PREVIEW_ROWS).min(rows.end);
+                let end_col = (col + PREVIEW_COLS).min(cols.end);
+                if self.cell(row.max(rows.start), col.max(cols.start)).is_none()
+                    || self.cell(end_row - 1, end_col - 1).is_none() {
+                    return Some(PreviewRange {
+                        rows: row..(row + PREVIEW_ROWS).min(self.rows),
+                        cols: col..(col + PREVIEW_COLS).min(self.cols.len()),
+                    });
+                }
+            }
+        }
+        None
+    }
+
+    fn load_visible(&mut self, cx: &mut Context<TableState<Self>>) {
         if self.loading || self.load_error.is_some() { return; }
         let Some(spool) = self.spool.clone() else { return };
-        let col_end = (col + 32).min(self.cols.len());
-        let count = (4 * 1024 * 1024 / (col_end - col).max(1).saturating_mul(1280)).clamp(1, WINDOW_MARGIN * 3);
-        let end = (row + count).min(self.rows);
-        if row >= end { return; }
+        let Some(range) = self.next_preview() else { return };
         self.loading = true;
         let generation = self.generation;
-        let task = cx.background_executor().spawn(async move { read_window(&spool, row, end, col..col_end) });
+        let task = cx.background_executor().spawn(async move {
+            read_window(&spool, range.rows.start, range.rows.end, range.cols.clone())
+                .map(|cells| PreviewTile { range, cells })
+        });
         cx.spawn(async move |table, cx| {
             let result = task.await;
             let _ = table.update(cx, |table, cx| {
@@ -125,32 +213,24 @@ impl ResultGrid {
                 if grid.generation != generation { return; }
                 grid.loading = false;
                 match result {
-                    Ok(win) => { grid.win_start = row; grid.col_start = col; grid.win = win; }
+                    Ok(tile) => grid.preview.insert(tile, &grid.visible),
                     Err(e) => { grid.load_error = Some(e); }
                 }
-                let (wanted_row, wanted_col) = grid.wanted;
-                if !grid.contains(wanted_row, wanted_col) {
-                    grid.load_window(wanted_row, wanted_col, cx);
-                }
+                grid.load_visible(cx);
                 cx.notify();
             });
         }).detach();
     }
 
-    fn cell(&mut self, row: usize, col: usize, cx: &mut Context<TableState<Self>>) -> Option<Option<SharedString>> {
-        if !self.contains(row, col) {
-            self.load_window(row, col, cx);
-        }
-        self.win.get(row.checked_sub(self.win_start)?).and_then(|r| r.get(col.checked_sub(self.col_start)?)).cloned()
-    }
-
-    fn contains(&self, row: usize, col: usize) -> bool {
-        self.win.get(row.wrapping_sub(self.win_start)).is_some_and(|r| col >= self.col_start && col - self.col_start < r.len())
+    fn cell(&self, row: usize, col: usize) -> Option<Option<SharedString>> {
+        // Rendering also happens for off-screen layout measurements (row 0).
+        // It must never schedule IO or replace the actual viewport's previews.
+        self.preview.cell(row, col)
     }
 
     /// Cached preview for synchronous table helpers. Full-value copy is async.
     pub fn full_text(&self, row: usize, col: usize) -> Option<String> {
-        self.win.get(row.checked_sub(self.win_start)?)?.get(col.checked_sub(self.col_start)?)?.as_ref().map(|s| s.to_string())
+        self.cell(row, col)?.as_ref().map(|s| s.to_string())
     }
 }
 
@@ -239,7 +319,7 @@ impl TableDelegate for ResultGrid {
         let theme = cx.theme().clone();
         let d = div().w_full().overflow_hidden().whitespace_nowrap().text_ellipsis();
         let d = if kind == ColumnKind::Number { d.text_right() } else { d };
-        match self.cell(row, col, cx) {
+        match self.cell(row, col) {
             Some(Some(v)) => {
                 let color = match kind {
                     ColumnKind::Number => Some(theme.blue),
@@ -258,7 +338,9 @@ impl TableDelegate for ResultGrid {
         self.full_text(row, col).unwrap_or_default()
     }
 
-    fn visible_rows_changed(&mut self, range: Range<usize>, _: &mut Window, _: &mut Context<TableState<Self>>) {
+    fn visible_rows_changed(&mut self, range: Range<usize>, _: &mut Window, cx: &mut Context<TableState<Self>>) {
+        self.visible.rows = range.clone();
+        self.load_visible(cx);
         let (Some(q), Some(spool)) = (self.query, &self.spool) else { return };
         if spool.progress().status != nbq_engine::SpoolStatus::Open {
             return;
@@ -270,6 +352,11 @@ impl TableDelegate for ResultGrid {
             self.engine.ensure_rows(self.tab, q, want);
         }
     }
+
+    fn visible_columns_changed(&mut self, range: Range<usize>, _: &mut Window, cx: &mut Context<TableState<Self>>) {
+        self.visible.cols = range;
+        self.load_visible(cx);
+    }
 }
 
 #[cfg(test)]
@@ -277,6 +364,101 @@ mod tests {
     use super::*;
     use arrow_array::{Int64Array, RecordBatch, StringArray};
     use arrow_schema::{DataType, Field, Schema};
+
+    fn fixture(rows: usize, cols: usize) -> (tempfile::TempDir, ResultGrid, Arc<Spool>) {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = Arc::new(Schema::new((0..cols).map(|col| Field::new(format!("c{col}"), DataType::Int64, false)).collect::<Vec<_>>()));
+        let spool = Spool::create(dir.path(), schema).unwrap();
+        append_rows(&spool, 0..rows);
+        let (engine, _) = Engine::new(nbq_engine::EngineOptions::new(dir.path().join("engine")));
+        let mut grid = ResultGrid::new(engine, TabId(1));
+        grid.set_result(QueryId(1), spool.clone());
+        (dir, grid, spool)
+    }
+
+    fn append_rows(spool: &Spool, rows: Range<usize>) {
+        let batch = RecordBatch::try_new(spool.schema().clone(), (0..spool.schema().fields().len()).map(|col| {
+            Arc::new(Int64Array::from_iter_values(rows.clone().map(|row| (col * 100_000 + row) as i64))) as _
+        }).collect()).unwrap();
+        spool.append(&batch).unwrap();
+    }
+
+    fn load_previews(grid: &mut ResultGrid, spool: &Spool) {
+        for _ in 0..PREVIEW_TILES {
+            let Some(range) = grid.next_preview() else { return };
+            let cells = read_window(spool, range.rows.start, range.rows.end, range.cols.clone()).unwrap();
+            grid.preview.insert(PreviewTile { range, cells }, &grid.visible);
+        }
+        panic!("preview requests did not settle");
+    }
+
+    #[::core::prelude::v1::test]
+    fn offscreen_measurement_cannot_evict_visible_rows_or_restart_loading() {
+        let (_dir, mut grid, spool) = fixture(3000, 2);
+        grid.visible = PreviewRange { rows: 0..15, cols: 0..2 };
+        load_previews(&mut grid, &spool);
+        grid.visible.rows = 950..970; // Beyond both the initial fetch and old preview window.
+        load_previews(&mut grid, &spool);
+        for _ in 0..20 {
+            let _ = grid.cell(0, 0); // GPUI's off-screen row-height measurement.
+            assert_eq!(grid.full_text(950, 0).as_deref(), Some("950"));
+            assert_eq!(grid.full_text(969, 1).as_deref(), Some("100969"));
+            assert!(grid.next_preview().is_none());
+        }
+    }
+
+    #[::core::prelude::v1::test]
+    fn appending_rows_preserves_populated_cells_while_extending_a_partial_tile() {
+        let (_dir, mut grid, spool) = fixture(500, 2);
+        grid.visible = PreviewRange { rows: 490..500, cols: 0..2 };
+        load_previews(&mut grid, &spool);
+        append_rows(&spool, 500..2500);
+        assert!(grid.refresh_rows());
+        assert_eq!(grid.full_text(499, 0).as_deref(), Some("499"));
+        grid.visible.rows = 495..515;
+        assert!(grid.next_preview().is_some());
+        assert_eq!(grid.full_text(499, 0).as_deref(), Some("499"));
+        load_previews(&mut grid, &spool);
+        assert_eq!(grid.full_text(514, 0).as_deref(), Some("514"));
+    }
+
+    #[::core::prelude::v1::test]
+    fn horizontal_and_vertical_tiles_coexist_and_follow_the_latest_viewport() {
+        let (_dir, mut grid, spool) = fixture(3000, 70);
+        grid.visible = PreviewRange { rows: 990..1020, cols: 12..51 };
+        // A request completing after a fast scroll must be followed by the latest viewport.
+        let old_request = grid.next_preview().unwrap();
+        grid.visible.rows = 1980..2015;
+        let cells = read_window(&spool, old_request.rows.start, old_request.rows.end, old_request.cols.clone()).unwrap();
+        grid.preview.insert(PreviewTile { range: old_request, cells }, &grid.visible);
+        load_previews(&mut grid, &spool);
+        for row in grid.visible.rows.clone() {
+            for col in grid.visible.cols.clone() {
+                assert_eq!(grid.full_text(row, col), Some((col * 100_000 + row).to_string()));
+            }
+        }
+        assert!(grid.next_preview().is_none());
+    }
+
+    #[::core::prelude::v1::test]
+    fn preview_cache_is_bounded_and_keeps_current_viewport_tiles() {
+        let mut cache = PreviewCache::default();
+        let visible = PreviewRange { rows: 0..32, cols: 0..16 };
+        for page in 0..100 {
+            let range = PreviewRange { rows: page * 32..(page + 1) * 32, cols: 0..16 };
+            cache.insert(PreviewTile { range, cells: vec![vec![Some(SharedString::from("🙂".repeat(MAX_CELL_CHARS))); 16]; 32] }, &visible);
+            assert!(cache.bytes <= PREVIEW_BYTES);
+            assert!(cache.tiles.len() <= PREVIEW_TILES);
+            assert!(cache.cell(0, 0).is_some(), "visible tile was evicted");
+        }
+        // Tiny cells still have a strict tile count bound.
+        for page in 100..200 {
+            let range = PreviewRange { rows: page * 32..(page + 1) * 32, cols: 0..1 };
+            cache.insert(PreviewTile { range, cells: vec![vec![None]; 32] }, &visible);
+        }
+        assert!(cache.tiles.len() <= PREVIEW_TILES);
+        assert!(cache.cell(0, 0).is_some());
+    }
 
     #[::core::prelude::v1::test]
     fn preview_reads_bounded_batches_and_projects_columns() {

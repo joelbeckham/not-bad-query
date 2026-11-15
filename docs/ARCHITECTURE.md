@@ -52,6 +52,11 @@ in-memory index. The grid asks `spool.read(rows)` for its visible window and get
 zero-copy slices of the covering batches. Decoded caches are limited to 16 MiB per
 result and 64 MiB across an engine. The UI loads and formats previews off the render
 thread (at most 32 columns and approximately 4 MiB of preview text per window).
+Formatted previews use aligned 32-row by 16-column tiles, capped at approximately
+4 MiB and 64 entries. Only the visible viewport schedules background preview IO;
+off-screen layout measurements (including GPUI's row-0 height probe) read the
+cache without changing demand. Neighboring tiles coexist, and appending immutable
+spool rows retains already-rendered cells while a partial tile is extended.
 Full-cell copying also reads on a background executor. Appends/compression run on
 Tokio's blocking pool rather than its session workers.
 

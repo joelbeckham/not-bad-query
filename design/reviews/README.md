@@ -35,6 +35,31 @@ and regeneration instructions are in `../../crates/nbq-app/assets/README.md`.
 
 ## Claude review status: pending access
 
+### Results scrolling stability — 2026-11-14
+
+- `grid-scroll-before.png`: reproduced repeated `…` placeholders after scrolling
+  beyond the initial fetch in the isolated sample-project debug preview.
+- `grid-scroll-after.png`: stable values around rows 793–804 after the same scroll.
+- `grid-scroll-later-page.png`: stable values around rows 3443–3454, after demand
+  fetched a second page (4514 rows available).
+
+The preview ran `select i as id, 'Row ' || i as label from
+generate_series(1, 20000) i`. Process-targeted wheel input reproduced the old
+failure. After the fix, 12 successive stationary captures of the result-cell
+region were pixel-identical at each of the two later viewports. Repeated runs
+also populated the first page without needing a changed visible-range callback.
+
+Cell rendering now reads cached values only; it cannot schedule IO for GPUI's
+off-screen row-0 height measurement. Preview loads follow the actual viewport,
+keep adjacent row/column tiles together within a 4 MiB/64-tile budget, and retain
+immutable fetched cells when more rows arrive. All 106 workspace tests pass,
+including off-screen measurement, append preservation, rapid viewport changes,
+horizontal/vertical tile coverage, and preview-cache bounds.
+
+A fresh read-only Claude review was attempted for these screenshots and failed
+before image inspection with the same organization-access error below. Native
+screenshots were inspected by Codex; Claude sign-off remains pending access.
+
 ### Connection status and session controls — 2026-11-14
 
 The isolated debug preview opened `dev/sample-project`. These screenshots show

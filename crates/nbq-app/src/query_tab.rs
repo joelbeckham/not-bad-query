@@ -383,9 +383,12 @@ impl QueryTab {
             Event::ResultOpened { query, spool, .. } => {
                 self.fetch = None;
                 self.grid.update(cx, |g, cx| {
+                    let visible_rows = g.visible_range().rows().len().max(1);
+                    let visible_cols = g.visible_range().cols().clone();
                     g.delegate_mut().set_result(query, spool);
                     g.refresh(cx);
                     g.scroll_to_row(0, cx);
+                    g.delegate_mut().prepare_preview(0..visible_rows, visible_cols, cx);
                     cx.notify();
                 });
             }
@@ -416,6 +419,9 @@ impl QueryTab {
                     self.fetch = Some((progress, paused));
                     self.grid.update(cx, |g, cx| {
                         if g.delegate_mut().refresh_rows() {
+                            let rows = g.visible_range().rows().clone();
+                            let cols = g.visible_range().cols().clone();
+                            g.delegate_mut().prepare_preview(rows, cols, cx);
                             cx.notify();
                         }
                     });
