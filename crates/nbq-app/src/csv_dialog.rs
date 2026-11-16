@@ -37,6 +37,25 @@ pub fn open(
 }
 
 type Done = Rc<dyn Fn(Option<Recipe>, &mut Window, &mut App)>;
+
+fn engine_kind(index: usize) -> DbKind {
+    if index == 1 { DbKind::Sqlite } else { DbKind::DuckDb }
+}
+
+fn matching_destinations(destinations: &[nbq_core::Connection], index: usize) -> Vec<nbq_core::Connection> {
+    destinations
+        .iter()
+        .filter(|c| c.kind == engine_kind(index))
+        .cloned()
+        .collect()
+}
+
+fn destination_labels(destinations: &[nbq_core::Connection]) -> Vec<SharedString> {
+    std::iter::once("New database".into())
+        .chain(destinations.iter().map(|c| SharedString::from(c.name.clone())))
+        .collect()
+}
+
 fn open_settings(
     source: PathBuf,
     root: PathBuf,
@@ -51,16 +70,25 @@ fn open_settings(
     on_done: Done,
 ) {
     let stem = source.file_stem().unwrap_or_default().to_string_lossy().to_string();
-    let (database_name, table_name, engine_index) = draft.unwrap_or_else(|| (format!("{stem}.duckdb"), stem, 0));
+    let (database_name, table_name, engine_index) = draft.unwrap_or_else(|| {
+        let sqlite = target
+            .as_ref()
+            .and_then(|p| destinations.iter().find(|c| c.params(None).file_path == *p))
+            .is_some_and(|c| c.kind == DbKind::Sqlite);
+        (
+            format!("{stem}.{}", if sqlite { "sqlite" } else { "duckdb" }),
+            stem,
+            usize::from(sqlite),
+        )
+    });
     let database = cx.new(|cx| InputState::new(window, cx).default_value(database_name));
     let table = cx.new(|cx| InputState::new(window, cx).default_value(table_name));
     let kind = cx.new(|cx| SelectState::new(vec!["DuckDB", "SQLite"], Some(IndexPath::new(engine_index)), window, cx));
-    let labels: Vec<SharedString> = std::iter::once("New database".into())
-        .chain(destinations.iter().map(|c| SharedString::from(c.name.clone())))
-        .collect();
+    let initial_destinations = matching_destinations(&destinations, engine_index);
+    let labels = destination_labels(&initial_destinations);
     let target_index = target
         .as_ref()
-        .and_then(|p| destinations.iter().position(|c| c.params(None).file_path == *p))
+        .and_then(|p| initial_destinations.iter().position(|c| c.params(None).file_path == *p))
         .map_or(0, |i| i + 1);
     let destination = cx.new(|cx| SelectState::new(labels, Some(IndexPath::new(target_index)), window, cx));
     let header = cx.new(|cx| {
@@ -103,7 +131,12 @@ fn open_settings(
     let last_engine = std::cell::Cell::new(engine_index);
     window.open_dialog(cx, move |dialog, window, cx| {
         let selected_engine = kind.read(cx).selected_index(cx).map_or(0, |i| i.row);
+        let available = matching_destinations(&destinations, selected_engine);
         if last_engine.replace(selected_engine) != selected_engine {
+            destination.update(cx, |s, cx| {
+                s.set_items(destination_labels(&available), window, cx);
+                s.set_selected_index(Some(IndexPath::new(0)), window, cx);
+            });
             let mut path = PathBuf::from(database.read(cx).value().as_ref());
             if path.extension().is_some_and(|e| {
                 ["duckdb", "db", "sqlite", "sqlite3"]
@@ -119,7 +152,7 @@ fn open_settings(
             .read(cx)
             .selected_index(cx)
             .and_then(|ix| ix.row.checked_sub(1))
-            .and_then(|i| destinations.get(i))
+            .and_then(|i| available.get(i))
             .cloned();
         let field = |label: &'static str, el: AnyElement| {
             v_flex()
@@ -144,27 +177,18 @@ fn open_settings(
                     .text_sm()
                     .child(source.file_name().unwrap_or_default().to_string_lossy().to_string()),
             )
-            .child(field(
-                "Destination",
-                Select::new(&destination).disabled(working).into_any_element(),
-            ))
             .child(
                 h_flex()
                     .gap_3()
+                    .child(field("Engine", Select::new(&kind).disabled(working).into_any_element()))
                     .child(field(
-                        "Engine",
-                        if let Some(c) = &existing {
-                            div()
-                                .h(px(32.))
-                                .flex()
-                                .items_center()
-                                .text_sm()
-                                .child(if c.kind == DbKind::DuckDb { "DuckDB" } else { "SQLite" })
-                                .into_any_element()
-                        } else {
-                            Select::new(&kind).disabled(working).into_any_element()
-                        },
-                    ))
+                        "Destination",
+                        Select::new(&destination).disabled(working).into_any_element(),
+                    )),
+            )
+            .child(
+                h_flex()
+                    .gap_3()
                     .when(existing.is_none(), |row| {
                         row.child(field(
                             "Database in connections/",
@@ -219,7 +243,7 @@ fn open_settings(
                                     .read(cx)
                                     .selected_index(cx)
                                     .and_then(|i| i.row.checked_sub(1))
-                                    .and_then(|i| destinations.get(i))
+                                    .and_then(|i| destinations.iter().filter(|c| c.kind == engine_kind(draft.2)).nth(i))
                                     .map(|c| c.params(None).file_path);
                                 let (source, root, destinations, engine, on_done, loading) = (
                                     source.clone(),
@@ -360,13 +384,11 @@ fn open_settings(
                             .disabled(working)
                             .label(if working { "Importing…" } else { "Import" })
                             .on_click(move |_, window, cx| {
-                                let engine_kind = existing.as_ref().map(|c| c.kind).unwrap_or_else(|| {
-                                    if kind.read(cx).selected_value() == Some(&"SQLite") {
-                                        DbKind::Sqlite
-                                    } else {
-                                        DbKind::DuckDb
-                                    }
-                                });
+                                let engine_kind = engine_kind(kind.read(cx).selected_index(cx).map_or(0, |i| i.row));
+                                if existing.as_ref().is_some_and(|c| c.kind != engine_kind) {
+                                    window.push_notification("Choose a destination for the selected engine", cx);
+                                    return;
+                                }
                                 if (header.read(cx).selected_value() == Some(&"First row is headers")) != headers
                                     || [b',', b'\t', b';', b'|']
                                         [delimiter.read(cx).selected_index(cx).map_or(0, |i| i.row)]
@@ -384,8 +406,18 @@ fn open_settings(
                                 {
                                     filename.set_extension("sqlite");
                                 }
-                                if !filename.extension().is_some_and(|e| engine_kind.file_extensions().iter().any(|x| e.eq_ignore_ascii_case(x))) {
-                                    filename = PathBuf::from(format!("{}.{}", filename.display(), if engine_kind == DbKind::DuckDb { "duckdb" } else { "sqlite" }));
+                                if !filename.extension().is_some_and(|e| {
+                                    engine_kind.file_extensions().iter().any(|x| e.eq_ignore_ascii_case(x))
+                                }) {
+                                    filename = PathBuf::from(format!(
+                                        "{}.{}",
+                                        filename.display(),
+                                        if engine_kind == DbKind::DuckDb {
+                                            "duckdb"
+                                        } else {
+                                            "sqlite"
+                                        }
+                                    ));
                                 }
                                 let recipe = Recipe {
                                     source: source.clone(),
