@@ -14,6 +14,7 @@ use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::command::{Command, CommandItem, CommandState};
 use gpui_kit::component::dialog::{DialogAction, DialogClose, DialogFooter};
 use gpui_kit::component::notification::Notification;
+use gpui_kit::component::menu::ContextMenuExt as _;
 use gpui_kit::component::resizable::{h_resizable, resizable_panel};
 use gpui_kit::component::status_bar::StatusBar;
 use gpui_kit::component::tab::{Tab, TabBar};
@@ -1163,6 +1164,76 @@ impl Workbench {
         });
     }
 
+    fn rename_tab(&mut self, tab: Entity<QueryTab>, window: &mut Window, cx: &mut Context<Self>) {
+        use gpui_kit::component::input::{Input, InputState};
+        if tab.read(cx).saving { return; }
+        let saved = tab.read(cx).path.is_some();
+        let directory = tab.read(cx).path.as_ref().and_then(|p| p.parent().map(Path::to_path_buf))
+            .or_else(|| tab.read(cx).save_dir.clone()).or_else(|| self.project_scripts_dir(tab.read(cx).project));
+        if directory.is_none() { error(window, cx, "Open a project before renaming an unsaved tab."); return; }
+        let description = format!("{} {}", if saved { "Rename in" } else { "Save SQL script in" }, directory.unwrap().display());
+        let input = cx.new(|cx| InputState::new(window, cx).default_value(tab.read(cx).title()));
+        let owner = cx.entity();
+        let first = std::cell::Cell::new(true);
+        window.open_dialog(cx, move |dialog, window, cx| {
+            if first.replace(false) { input.read(cx).focus_handle(cx).focus(window, cx); }
+            let (input_ok, owner, tab) = (input.clone(), owner.clone(), tab.clone());
+            dialog.title(if saved { "Rename script" } else { "Save script" })
+                .child(div().text_sm().text_color(cx.theme().muted_foreground).child(description.clone()))
+                .child(Input::new(&input))
+                .footer(DialogFooter::new()
+                    .child(div().w(px(88.)).child(DialogClose::new().trigger(|b| b.outline().w_full().label("Cancel"))))
+                    .child(div().w(px(88.)).child(DialogAction::new().child(Button::new("rename-tab").primary().w_full().label(if saved { "Rename" } else { "Save" }).disabled(input.read(cx).value().trim().is_empty())))))
+                .on_ok(move |_, window, cx| {
+                    let name = input_ok.read(cx).value().trim().to_string();
+                    if name.is_empty() || name == "." || name == ".." || name.ends_with('.') || name.chars().any(|c| c.is_control() || "<>:\"/\\|?*".contains(c)) {
+                        error(window, cx, "Enter a valid file name."); return false;
+                    }
+                    owner.update(cx, |wb, cx| {
+                        let t = tab.read(cx);
+                        if t.saving { return; }
+                        if let Some(from) = t.path.clone() {
+                            let mut to = from.with_file_name(&name);
+                            if to.extension().is_none() { if let Some(ext) = from.extension() { to.set_extension(ext); } }
+                            if from != to {
+                                if project_for_path(&wb.projects.borrow(), &from).is_some() {
+                                    wb.tree_operation(Some(from), to, window, cx);
+                                } else {
+                                    tab.update(cx, |t, _| t.saving = true);
+                                    let tab = tab.clone();
+                                    cx.spawn_in(window, async move |this, cx| {
+                                        let destination = to.clone();
+                                        let result = cx.background_executor().spawn(async move {
+                                            // Windows rename refuses to replace an existing file.
+                                            std::fs::rename(&from, &destination)
+                                        }).await;
+                                        let _ = this.update_in(cx, |_, window, cx| {
+                                            tab.update(cx, |t, cx| {
+                                                t.saving = false;
+                                                match result {
+                                                    Ok(()) => t.set_path(to, cx),
+                                                    Err(e) => error(window, cx, format!("Rename failed: {e}")),
+                                                }
+                                            });
+                                            cx.notify();
+                                        });
+                                    }).detach();
+                                }
+                            }
+                        } else {
+                            let dir = t.save_dir.clone().or_else(|| wb.project_scripts_dir(t.project));
+                            if let Some(dir) = dir {
+                                let name = if Path::new(&name).extension().is_none() { format!("{name}.sql") } else { name };
+                                let text = t.text(cx);
+                                wb.save_script(tab.clone(), dir.join(name), text, None, window, cx);
+                            } else { error(window, cx, "Open a project before renaming an unsaved tab."); }
+                        }
+                    });
+                    true
+                })
+        });
+    }
+
     fn render_tabs(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
         TabBar::new("query-tabs")
@@ -1173,6 +1244,7 @@ impl Workbench {
                 cx.notify();
             }))
             .children(self.tabs.iter().enumerate().map(|(ix, t)| {
+                let tab = t.clone();
                 let t = t.read(cx);
                 let color = t.conn.as_ref().map(|c| conn_color(c, cx)).unwrap_or(theme.muted_foreground.opacity(0.5));
                 let indicator = if t.is_running() {
@@ -1186,7 +1258,21 @@ impl Workbench {
                     .child(
                         h_flex()
                             .gap_1()
-                            .child(t.title())
+                            .child(div().id(("tab-name", ix)).child(t.title()).on_click(cx.listener({
+                                let tab = tab.clone();
+                                move |wb, ev: &ClickEvent, window, cx| {
+                                    if ev.click_count() == 2 { cx.stop_propagation(); wb.rename_tab(tab.clone(), window, cx); }
+                                }
+                            }))
+                    .context_menu({
+                        let owner = cx.entity();
+                        move |menu, _, _| {
+                            let (owner, tab) = (owner.clone(), tab.clone());
+                            menu.item(gpui_kit::component::menu::PopupMenuItem::new("Rename").on_click(move |_, window, cx| {
+                                owner.update(cx, |wb, cx| wb.rename_tab(tab.clone(), window, cx));
+                            }))
+                        }
+                    }))
                             .when(t.dirty, |el| el.child(div().text_color(theme.muted_foreground).child("●")))
                             .when(pending, |el| {
                                 el.child(
@@ -1211,6 +1297,7 @@ impl Workbench {
                                 this.close_tab(ix, window, cx);
                             })),
                     )
+
             }))
             .suffix(
                 Button::new("new-tab")
