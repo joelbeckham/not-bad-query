@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use gpui_kit::assets::IconName as Lucide;
+use gpui_kit::component::Disableable as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::command::{Command, CommandItem, CommandState};
 use gpui_kit::component::dialog::{DialogAction, DialogClose, DialogFooter};
@@ -570,6 +571,34 @@ impl Workbench {
                 tab.update(cx, |t, _| t.save_dir = Some(dir));
                 self.focus_editor(window, cx);
             }
+            SidebarEvent::NewFolder(dir) => {
+                use gpui_kit::component::input::{Input, InputState};
+                let input = cx.new(|cx| InputState::new(window, cx).placeholder("Folder name"));
+                let owner = cx.entity();
+                let dir = dir.clone();
+                let destination_label = self.projects.borrow().iter().find(|p| dir.starts_with(&p.root)).map(|p| format!("{} / {}", p.name(), dir.strip_prefix(&p.root).unwrap_or(&dir).display())).unwrap_or_else(|| dir.display().to_string());
+                let first = std::cell::Cell::new(true);
+                window.open_dialog(cx, move |dialog, window, cx| {
+                    if first.replace(false) { input.read(cx).focus_handle(cx).focus(window, cx); }
+                    let (input_ok, owner, dir) = (input.clone(), owner.clone(), dir.clone());
+                    dialog.title("New folder")
+                        .child(div().text_sm().text_color(cx.theme().muted_foreground).child(format!("Create in {}", destination_label)))
+                        .child(Input::new(&input))
+                        .footer(DialogFooter::new()
+                            .child(div().w(px(88.)).child(DialogClose::new().trigger(|button| button.outline().w_full().label("Cancel"))))
+                            .child(div().w(px(88.)).child(DialogAction::new().child(Button::new("create-folder").primary().w_full().label("Create").disabled(input.read(cx).value().trim().is_empty())))))
+                        .on_ok(move |_, window, cx| {
+                            let name = input_ok.read(cx).value().trim().to_string();
+                            if name.is_empty() || name == "." || name == ".." || name.ends_with(['.', ' ']) || name.chars().any(|c| c.is_control() || "<>:\"/\\|?*".contains(c)) {
+                                error(window, cx, "Enter a valid folder name."); return false;
+                            }
+                            let path = dir.join(name);
+                            owner.update(cx, |wb, cx| wb.tree_operation(None, path, window, cx));
+                            true
+                        })
+                });
+            }
+            SidebarEvent::Move { from, to } => self.tree_operation(Some(from.clone()), to.clone(), window, cx),
             SidebarEvent::NewProject => self.new_project(window, cx),
             SidebarEvent::OpenProject(None) => self.pick_project(window, cx),
             SidebarEvent::OpenProject(Some(root)) => self.open_project(root.clone(), window, cx),
@@ -1064,6 +1093,39 @@ impl Workbench {
             self.open_palette(window, cx);
         }
         cx.notify();
+    }
+
+    fn tree_operation(&mut self, from: Option<PathBuf>, to: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(mut project) = self.projects.borrow().iter().find(|p| to.starts_with(&p.root)).cloned() else { return; };
+        if self.tabs.iter().any(|tab| tab.read(cx).saving) { error(window, cx, "Wait for the script save to finish before moving files."); return; }
+        let original = from.clone();
+        let destination = to.clone();
+        let task = cx.background_executor().spawn(async move {
+            let result = if let Some(from) = from { project.move_tree_entry(&from, &to).map_err(|e| e.to_string()) }
+                else { std::fs::create_dir(&to).map_err(|e| e.to_string()).and_then(|_| project.reload().map_err(|e| e.to_string())) };
+            (project, result)
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let (project, result) = task.await;
+            let _ = this.update_in(cx, |wb, window, cx| {
+                match result {
+                    Err(e) => error(window, cx, &e),
+                    Ok(()) => {
+                        if let Some(p) = wb.projects.borrow_mut().iter_mut().find(|p| p.key == project.key) { *p = project; }
+                        if let Some(from) = original {
+                            for tab in &wb.tabs {
+                                tab.update(cx, |t, cx| {
+                                    if let Some(path) = t.path.as_ref().and_then(|p| p.strip_prefix(&from).ok()).map(|tail| destination.join(tail)) { t.set_path(path, cx); }
+                                    if let Some(path) = t.save_dir.as_ref().and_then(|p| p.strip_prefix(&from).ok()).map(|tail| destination.join(tail)) { t.save_dir = Some(path); }
+                                });
+                            }
+                        }
+                        wb.sidebar.update(cx, |s, cx| s.refresh(cx));
+                        cx.notify();
+                    }
+                }
+            });
+        }).detach();
     }
 
     fn open_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {

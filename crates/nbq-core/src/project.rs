@@ -225,6 +225,38 @@ impl Project {
         c.project_root = self.root.clone();
     }
 
+    /// Move a tree entry without overwriting another entry. Preserve local path bindings.
+    pub fn move_tree_entry(&mut self, from: &Path, to: &Path) -> Result<()> {
+        let valid = [self.scripts_dir(), self.connections_dir()].iter().any(|root|
+            from.starts_with(root) && from != root && to.starts_with(root) && to != root);
+        if !valid || to.starts_with(from) || to.exists() || to.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+            return Err(ConfigError::Project("Cannot move here: invalid destination or name already exists".into()));
+        }
+        let root = std::fs::canonicalize(&self.root).map_err(io_err(&self.root))?;
+        for path in [from, to.parent().unwrap_or(to)] {
+            if !std::fs::canonicalize(path).map_err(io_err(path))?.starts_with(&root) {
+                return Err(ConfigError::Project("Cannot move outside the project".into()));
+            }
+        }
+        std::fs::rename(from, to).map_err(io_err(to))?;
+        let remap = |path: &Path| path.strip_prefix(from).ok().map(|tail| to.join(tail));
+        let scripts = self.scripts_dir();
+        self.local.script_connections = std::mem::take(&mut self.local.script_connections).into_iter().map(|(path, id)| {
+            let path = remap(&scripts.join(&path)).and_then(|p| p.strip_prefix(&scripts).ok().map(|p| p.to_string_lossy().replace('\\', "/"))).unwrap_or(path);
+            (path, id)
+        }).collect();
+        self.local.database_ids = std::mem::take(&mut self.local.database_ids).into_iter().map(|(path, id)| {
+            let path = remap(&self.root.join(&path)).and_then(|p| p.strip_prefix(&self.root).ok().map(|p| p.to_string_lossy().replace('\\', "/"))).unwrap_or(path);
+            (path, id)
+        }).collect();
+        for recipe in &mut self.local.csv_imports {
+            if let Some(path) = remap(&self.root.join(&recipe.source)) { recipe.source = path.strip_prefix(&self.root).unwrap_or(&path).to_path_buf(); }
+            if let Some(path) = remap(&self.root.join(&recipe.database)) { recipe.database = path.strip_prefix(&self.root).unwrap_or(&path).to_path_buf(); }
+        }
+        self.save_local()?;
+        self.reload()
+    }
+
     pub fn save_local(&self) -> Result<()> {
         let dir = self.root.join(LOCAL_DIR);
         std::fs::create_dir_all(&dir).map_err(io_err(&dir))?;
@@ -527,6 +559,35 @@ mod tests {
         assert!(p.is_relevant_change(&d.path().join("scripts/a/b.sql")));
         assert!(!p.is_relevant_change(&d.path().join("exports/big.csv")));
         assert!(!p.is_relevant_change(&d.path().join(".not-bad-query/local.toml")));
+    }
+
+    #[test]
+    fn tree_moves_preserve_bindings_and_reject_collisions() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/tree-tests");
+        std::fs::create_dir_all(&root).unwrap();
+        let root = std::fs::canonicalize(root).unwrap();
+        let d = tempfile::tempdir_in(root).unwrap();
+        let mut p = Project::create(d.path(), "Tree").unwrap();
+        let c = p.save_connection(conn("db", None)).unwrap();
+        let scripts = p.scripts_dir();
+        std::fs::create_dir(scripts.join("reports")).unwrap();
+        std::fs::create_dir(scripts.join("archive")).unwrap();
+        let script = scripts.join("reports/daily.sql");
+        std::fs::write(&script, "select 1").unwrap();
+        p.set_script_connection(&script, Some(&c.id)).unwrap();
+        p.move_tree_entry(&scripts.join("reports"), &scripts.join("archive/reports")).unwrap();
+        assert!(scripts.join("archive/reports/daily.sql").is_file());
+        assert_eq!(p.script_connection(&scripts.join("archive/reports/daily.sql")).unwrap().id, c.id);
+        assert!(p.move_tree_entry(&scripts.join("archive"), &scripts.join("archive/reports/loop")).is_err());
+        std::fs::write(scripts.join("daily.sql"), "keep me").unwrap();
+        assert!(p.move_tree_entry(&scripts.join("archive/reports/daily.sql"), &scripts.join("daily.sql")).is_err());
+        assert_eq!(std::fs::read_to_string(scripts.join("daily.sql")).unwrap(), "keep me");
+        let old = p.connection_file(&c);
+        std::fs::create_dir(p.connections_dir().join("Dev")).unwrap();
+        let new = p.connections_dir().join("Dev/db.toml");
+        p.move_tree_entry(&old, &new).unwrap();
+        assert_eq!(p.connections.get(&c.id).unwrap().folder.as_deref(), Some("Dev"));
+        assert!(p.move_tree_entry(&new, &scripts.join("db.toml")).is_err());
     }
 
     #[test]

@@ -38,6 +38,8 @@ pub enum SidebarEvent {
     SelectFrom { conn: String, schema: String, name: String },
     /// An untitled tab that saves into `dir`.
     NewScript { project: u32, dir: PathBuf },
+    NewFolder(PathBuf),
+    Move { from: PathBuf, to: PathBuf },
     NewProject,
     OpenProject(Option<PathBuf>),
     CloseProject(u32),
@@ -53,6 +55,14 @@ enum Node {
     Note { error: bool },
     ScriptDir { project: u32, dir: PathBuf },
     Script(PathBuf),
+}
+
+#[derive(Clone)]
+struct TreeDrag { path: PathBuf, root: PathBuf, label: SharedString }
+impl Render for TreeDrag {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        div().ml(px(20.)).mt(px(24.)).px_3().py_1().bg(cx.theme().popover).text_color(cx.theme().foreground).rounded_md().child(self.label.clone())
+    }
 }
 
 /// (connection key, object path)
@@ -515,6 +525,30 @@ impl Sidebar {
             .into_any_element()
     }
 
+    fn location(&self, node: &Node) -> Option<(PathBuf, PathBuf, bool)> {
+        let ps = self.projects.borrow();
+        match node {
+            Node::Section { project, scripts } => {
+                let p = ps.iter().find(|p| p.key == *project)?;
+                let root = if *scripts { p.scripts_dir() } else { p.connections_dir() };
+                Some((root.clone(), root, true))
+            }
+            Node::Folder { project, path } => {
+                let root = ps.iter().find(|p| p.key == *project)?.connections_dir();
+                Some((root.join(path), root, true))
+            }
+            Node::ScriptDir { project, dir } => Some((dir.clone(), ps.iter().find(|p| p.key == *project)?.scripts_dir(), true)),
+            Node::Script(path) => ps.iter().find(|p| path.starts_with(p.scripts_dir())).map(|p| (path.clone(), p.scripts_dir(), false)),
+            Node::Conn { key, .. } => {
+                let c = connection(&ps, key)?;
+                let p = ps.iter().find(|p| p.key == c.project_key)?;
+                let path = if p.local.database_ids.values().any(|id| id == &c.id) { p.root.join(&c.file_path) } else { p.connection_file(&c) };
+                Some((path, p.connections_dir(), false))
+            }
+            _ => None,
+        }
+    }
+
     fn context_menu(&self, node: Option<Node>, menu: PopupMenu, view: &Entity<Self>, window: &mut Window) -> PopupMenu {
         let emit = |ev: Rc<dyn Fn() -> SidebarEvent>| {
             window.listener_for(view, move |_, _: &ClickEvent, _, cx| cx.emit(ev()))
@@ -525,6 +559,7 @@ impl Sidebar {
         let reveal_item = |path: PathBuf| {
             PopupMenuItem::new("Show in file manager").icon(IconName::FolderOpen).on_click(move |_, _, _| reveal(&path))
         };
+        let folder_item = |dir: PathBuf| item("New folder...", IconName::Folder).on_click(emit(Rc::new(move || SidebarEvent::NewFolder(dir.clone()))));
         match node {
             Some(Node::Project(p)) => {
                 let root = root_of(p).unwrap_or_default();
@@ -545,6 +580,8 @@ impl Sidebar {
                 menu.item(item("New connection…", IconName::Plus).on_click(emit(Rc::new(move || {
                     SidebarEvent::NewConnection { project, folder: None }
                 }))))
+                .item(folder_item(root.clone()))
+                .separator()
                 .item(reveal_item(root))
             }
             Some(Node::Folder { project, path }) => {
@@ -552,6 +589,8 @@ impl Sidebar {
                 menu.item(item("New connection here…", IconName::Plus).on_click(emit(Rc::new(move || {
                     SidebarEvent::NewConnection { project, folder: Some(path.clone()) }
                 }))))
+                .item(folder_item(dir.clone()))
+                .separator()
                 .item(reveal_item(dir))
             }
             Some(Node::Section { project, scripts: true }) => {
@@ -561,6 +600,8 @@ impl Sidebar {
                     project,
                     dir: d2.clone(),
                 }))))
+                .item(folder_item(dir.clone()))
+                .separator()
                 .item(reveal_item(dir))
             }
             Some(Node::ScriptDir { project, dir }) => {
@@ -568,6 +609,8 @@ impl Sidebar {
                 menu.item(item("New script here", IconName::File).on_click(emit(Rc::new(move || {
                     SidebarEvent::NewScript { project, dir: d2.clone() }
                 }))))
+                .item(folder_item(dir.clone()))
+                .separator()
                 .item(reveal_item(dir))
             }
             Some(Node::Script(path)) => {
@@ -780,11 +823,31 @@ impl Render for Sidebar {
                 let view = v.clone();
                 let drop_view = v.clone();
                 let drop_conn = match n.get(&id) { Some(Node::Conn { key, .. }) => Some(key.clone()), _ => None };
+                let location = n.get(&id).and_then(|node| v.read(cx).location(node));
+                let source = location.as_ref().filter(|(path, root, _)| path != root).map(|(path, root, _)| TreeDrag { path: path.clone(), root: root.clone(), label: entry.item().label.clone() });
+                let target = location.filter(|(_, _, folder)| *folder);
+                let move_view = v.clone();
+                let content = div().id(("tree-row", ix)).w_full()
+                    .when_some(source, |row, drag| row.on_drag(drag, |drag, _, _, cx| cx.new(|_| drag.clone())))
+                    .when_some(target, |row, (dir, root, _)| {
+                        let highlight_dir = dir.clone();
+                        row.drag_over::<TreeDrag>(move |style, drag, _, cx| {
+                            if drag.root == root && !highlight_dir.starts_with(&drag.path) { style.bg(cx.theme().primary.opacity(0.14)) } else { style }
+                        }).on_drop(move |drag: &TreeDrag, _, cx| {
+                            cx.stop_propagation();
+                            if dir.starts_with(&drag.root) && !dir.starts_with(&drag.path) {
+                                if let Some(name) = drag.path.file_name() {
+                                    let to = dir.join(name);
+                                    if to != drag.path { move_view.update(cx, |_, cx| cx.emit(SidebarEvent::Move { from: drag.path.clone(), to })); }
+                                }
+                            }
+                        })
+                    });
                 ListItem::new(ix)
                     .selected(selected)
                     .py_0p5()
                     .pl(px(14.) * entry.depth() + px(8.))
-                    .child(h_flex().w_full().child(div().flex_1().min_w_0().child(el)).when_some(badge, |row, badge| row.child(badge)))
+                    .child(content.child(h_flex().w_full().child(div().flex_1().min_w_0().child(el)).when_some(badge, |row, badge| row.child(badge))))
                     .when_some(drop_conn, |row, key| row.on_drop(move |paths: &ExternalPaths, _, cx| {
                         cx.stop_propagation();
                         drop_view.update(cx, |_, cx| cx.emit(SidebarEvent::ImportFiles { paths: paths.paths().to_vec(), connection: key.clone() }));
