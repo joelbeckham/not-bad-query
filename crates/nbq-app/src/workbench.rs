@@ -16,6 +16,7 @@ use gpui_kit::component::notification::Notification;
 use gpui_kit::component::resizable::{h_resizable, resizable_panel};
 use gpui_kit::component::status_bar::StatusBar;
 use gpui_kit::component::tab::{Tab, TabBar};
+use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{
     ActiveTheme as _, Icon, IconName, Sizable as _, Theme, ThemeMode, TitleBar, WindowExt as _, h_flex, v_flex,
 };
@@ -415,6 +416,7 @@ impl Workbench {
         match ev {
             Event::MetadataConn { conn, state } => {
                 self.sidebar.update(cx, |s, cx| s.on_metadata_state(conn, state, cx));
+                cx.notify();
             }
             Event::Objects { conn, path, items } => {
                 self.sidebar.update(cx, |s, cx| s.on_objects(conn, path, items, cx));
@@ -1164,20 +1166,33 @@ impl Workbench {
             let t = t.read(cx);
             match &t.conn {
                 Some(c) => {
-                    let color = conn_color(c, cx);
-                    let state = match &t.conn_state {
+                    let profile_state = self.sidebar.read(cx).connection_state(&c.key());
+                    let state = match &profile_state {
                         ConnState::Connected => ("connected", theme.success),
                         ConnState::Connecting => ("connecting…", theme.warning),
                         ConnState::Failed(_) => ("failed", theme.danger),
                         ConnState::Disconnected => ("disconnected", theme.muted_foreground),
                     };
+                    let detail = match &t.conn_state {
+                        ConnState::Disconnected if matches!(profile_state, ConnState::Connected) =>
+                            "Connected. This tab's query session is idle; running a query opens it.".to_string(),
+                        ConnState::Disconnected => "Run a query to connect.".to_string(),
+                        ConnState::Connecting => "Query session connecting…".to_string(),
+                        ConnState::Connected => "Query session connected.".to_string(),
+                        ConnState::Failed(e) => format!("Query session failed: {e}"),
+                    };
+                    let detail = match &profile_state {
+                        ConnState::Failed(e) => format!("Connection error: {e}\n{detail}"),
+                        _ => detail,
+                    };
                     h_flex()
                         .gap_2()
                         .items_center()
-                        .child(div().size(px(8.)).rounded_full().bg(color))
+                        .child(div().size(px(8.)).rounded_full().bg(state.1))
                         .child(div().text_color(theme.foreground).child(c.name.clone()))
                         .child(if c.kind.is_file_based() { c.file_path.display().to_string() } else { format!("{}:{}/{}", c.host, c.port, c.database) })
-                        .child(div().text_color(state.1).child(state.0))
+                        .child(div().id("profile-status").text_color(state.1).child(state.0)
+                            .tooltip(move |window, cx| Tooltip::new(detail.clone()).text_xs().mb(px(18.)).build(window, cx)))
                         .into_any_element()
                 }
                 None => div().child("No connection").into_any_element(),

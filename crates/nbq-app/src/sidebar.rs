@@ -253,7 +253,8 @@ impl Sidebar {
         }
     }
 
-    fn connection_state(&self, key: &str) -> ConnState {
+    /// Shared profile status for the tree and workbench status bar.
+    pub fn connection_state(&self, key: &str) -> ConnState {
         if self.is_disconnected(key) { return ConnState::Disconnected; }
         combined_state(self.metadata_states.get(key).into_iter().chain(
             self.tab_states.iter().filter(|(k, _)| k == key).map(|(_, state)| state)

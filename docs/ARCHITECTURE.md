@@ -37,6 +37,9 @@ nbq-app (GPUI views)  ──commands──▶  nbq-engine (tokio runtime)
   object-browser session and all tabs using that profile; a failed session stays
   visible even if another is connected. Status is the last observed connection
   state, updated on connection attempts and database operations.
+  The status bar uses this same combined profile state. Its tooltip reports the
+  active query session separately, which may have expired while the object
+  browser remains connected. Metadata state changes invalidate both displays.
   Connect opens the browser session and retries disconnected/failed tabs.
   Disconnect releases all of the profile's sessions and cancels pending connects,
   retaining scripts, their selected profiles, and already-fetched result rows.
