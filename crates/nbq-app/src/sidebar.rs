@@ -12,6 +12,7 @@ use gpui_kit::component::list::ListItem;
 use gpui_kit::component::menu::{PopupMenu, PopupMenuItem};
 use gpui_kit::component::tree::{TreeEvent, TreeItem, TreeState, tree};
 use gpui_kit::component::tooltip::Tooltip;
+use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::{ActiveTheme as _, Icon, IconName, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -483,7 +484,12 @@ impl Sidebar {
             .items_center()
             .overflow_hidden()
             .child(chevron)
-            .child(icon.small().flex_shrink_0().when_some(color, |i, c| i.text_color(c)))
+            .child(if matches!(node, Some(Node::Note { error: false })) {
+                Spinner::new().icon(IconName::LoaderCircle).small().color(muted)
+                    .ease(|t| t).into_any_element()
+            } else {
+                icon.small().flex_shrink_0().when_some(color, |i, c| i.text_color(c)).into_any_element()
+            })
             .when_some(match node { Some(Node::Conn { state, .. }) => Some(state), _ => None }, |el, state| {
                 let (icon, color) = match state {
                     ConnState::Disconnected => (Lucide::Circle, muted),
@@ -497,7 +503,12 @@ impl Sidebar {
                 };
                 el.child(div().id(SharedString::from(format!("status:{entry_id}")))
                     .flex_shrink_0()
-                    .child(Icon::new(icon).xsmall().text_color(color))
+                    .child(if matches!(state, ConnState::Connecting) {
+                        Spinner::new().icon(IconName::LoaderCircle).xsmall().color(color)
+                            .ease(|t| t).into_any_element()
+                    } else {
+                        Icon::new(icon).xsmall().text_color(color).into_any_element()
+                    })
                     .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx)))
             })
             .child(

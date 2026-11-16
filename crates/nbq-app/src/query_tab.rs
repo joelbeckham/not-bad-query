@@ -10,6 +10,7 @@ use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Editor, EditorState, InputEvent};
 use gpui_kit::component::link::Link;
+use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::resizable::{resizable_panel, v_resizable};
 use gpui_kit::component::table::{DataTable, TableEvent, TableState};
@@ -534,6 +535,10 @@ impl QueryTab {
                     .small()
                     .outline()
                     .icon(conn_icon)
+                    .when(matches!(self.conn_state, ConnState::Connecting), |button| {
+                        button.icon(Spinner::new().icon(IconName::LoaderCircle)
+                            .color(theme.muted_foreground).ease(|t| t))
+                    })
                     .label(conn_label)
                     .tooltip("Connection for this tab")
                     .dropdown_menu(move |mut menu, window, _| {
