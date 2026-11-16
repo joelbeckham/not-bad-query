@@ -21,6 +21,7 @@ actions!(
         SaveFileAs,
         OpenFile,
         ExportCsv,
+        ImportCsv,
         CopyCell,
         NewConnection,
         NewProject,
@@ -67,6 +68,7 @@ pub fn bindings() -> Vec<KeyBinding> {
 /// Commands shown in the palette: (label, keystroke hint, action).
 pub fn palette() -> Vec<(&'static str, &'static str, Box<dyn Action>)> {
     vec![
+        ("Import CSV…", "", Box::new(ImportCsv)),
         ("Run statement", "Ctrl+Enter", Box::new(RunStatement)),
         ("Run script", "Alt+X", Box::new(RunScript)),
         ("Cancel query", "Ctrl+.", Box::new(CancelQuery)),

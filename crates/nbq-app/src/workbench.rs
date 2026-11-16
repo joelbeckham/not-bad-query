@@ -47,6 +47,8 @@ pub struct Workbench {
     close_armed: Option<EntityId>,
     quit_dialog_open: bool,
     closing: bool,
+    csv_queue: std::collections::VecDeque<PathBuf>,
+    csv_target: Option<PathBuf>,
     palette: Entity<CommandState>,
     focus: FocusHandle,
     _tasks: Vec<Task<()>>,
@@ -73,6 +75,95 @@ fn error(window: &mut Window, cx: &mut App, msg: impl Into<SharedString>) {
 }
 
 impl Workbench {
+    fn check_csv_sources(&self, window: &mut Window, cx: &mut Context<Self>) {
+        for project in self.projects.borrow().iter() {
+            let key = project.key;
+            let result = self.engine.csv_source_changes(project.root.clone(), project.local.csv_imports.clone());
+            cx.spawn_in(window, async move |this, cx| {
+                if let Ok(paths) = result.await { let _ = this.update_in(cx, |wb, _, cx| wb.sidebar.update(cx, |s, cx| s.set_csv_changes(key, paths, cx))); }
+            }).detach();
+        }
+    }
+    fn pick_csv(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        cx.spawn_in(window, async move |this, cx| {
+            if let Some(files) = rfd::AsyncFileDialog::new().add_filter("CSV", &["csv"]).pick_files().await {
+                let _ = this.update_in(cx, |wb, window, cx| wb.csv_batch(files.iter().map(|f| f.path().to_path_buf()).collect(), None, window, cx));
+            }
+        }).detach();
+    }
+
+    fn csv_batch(&mut self, paths: Vec<PathBuf>, target: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
+        self.csv_queue = paths.into_iter().filter(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("csv"))).collect();
+        self.csv_target = target;
+        if let Some(path) = self.csv_queue.pop_front() { self.open_csv_options(path, false, true, window, cx); }
+    }
+
+    fn open_csv(&mut self, path: PathBuf, reload: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_csv_options(path, reload, false, window, cx);
+    }
+
+    fn open_csv_options(&mut self, path: PathBuf, reload: bool, force: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let projects = self.projects.borrow();
+        let project = self.csv_target.as_ref().and_then(|target| projects.iter().find(|p| p.connections.connections.iter().any(|c| c.params(None).file_path == *target)))
+            .or_else(|| projects.iter().find(|p| p.contains(&path))).or_else(|| self.active_tab().and_then(|t| t.read(cx).project).and_then(|key| projects.iter().find(|p| p.key == key))).or_else(|| projects.first());
+        let Some(project) = project else { error(window, cx, "Open a project before importing CSV"); return; };
+        let (key, root) = (project.key, project.root.clone());
+        let destinations = project.connections.connections.iter().filter(|c| c.kind.is_file_based()).cloned().collect::<Vec<_>>();
+        let linked = project.local.csv_imports.iter().rev().find(|r| !force && project.root.join(&r.source) == path).cloned();
+        drop(projects);
+        if let Some(mut recipe) = linked {
+            recipe.source = root.join(&recipe.source); recipe.database = root.join(&recipe.database);
+            if !reload { self.show_csv(key, recipe, window, cx); return; }
+            let owner = cx.weak_entity();
+            crate::csv_dialog::reload(recipe, self.engine.clone(), window, cx, move |recipe, window, cx| { let _ = owner.update(cx, |wb, cx| wb.csv_done(key, recipe, window, cx)); });
+            return;
+        }
+        let preview = self.engine.preview_csv(path.clone(), None, true);
+        let engine = self.engine.clone();
+        let target = self.csv_target.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let result = preview.await.unwrap_or_else(|e| Err(e.to_string()));
+            let _ = this.update_in(cx, |_, window, cx| match result {
+                Ok(preview) => { let owner = cx.weak_entity(); crate::csv_dialog::open(path, root, preview, destinations, target, engine, window, cx, move |recipe, window, cx| { let _ = owner.update(cx, |wb, cx| match recipe { Some(recipe) => wb.csv_done(key, recipe, window, cx), None => { wb.csv_queue.clear(); wb.csv_target = None; } }); }); }
+                Err(e) => error(window, cx, e),
+            });
+        }).detach();
+    }
+
+    fn csv_done(&mut self, key: u32, recipe: nbq_driver::csv_import::Recipe, window: &mut Window, cx: &mut Context<Self>) {
+        let project = self.projects.borrow().iter().find(|p| p.key == key).cloned();
+        let Some(project) = project else { error(window, cx, "Import succeeded; the project was closed before its link could be saved"); return; };
+        let result = self.engine.record_csv_import(project, recipe.clone());
+        cx.spawn_in(window, async move |this, cx| {
+            let result = result.await.unwrap_or_else(|e| Err(e.to_string()));
+            let _ = this.update_in(cx, |wb, window, cx| {
+                match result {
+                    Ok(saved) => {
+                        if let Some(project) = wb.projects.borrow_mut().iter_mut().find(|p| p.key == key) {
+                            project.connections = saved.connections;
+                            project.local.csv_imports = saved.local.csv_imports;
+                            project.local.database_ids = saved.local.database_ids;
+                        }
+                        wb.sidebar.update(cx, |s, cx| s.refresh(cx));
+                        wb.check_csv_sources(window, cx);
+                        wb.csv_target = Some(recipe.database.clone());
+                        wb.show_csv(key, recipe, window, cx);
+                        if let Some(path) = wb.csv_queue.pop_front() { wb.open_csv_options(path, false, true, window, cx); } else { wb.csv_target = None; }
+                    }
+                    Err(e) => error(window, cx, format!("Import succeeded, but saving its link failed: {e}")),
+                }
+            });
+        }).detach();
+    }
+    fn show_csv(&mut self, key: u32, recipe: nbq_driver::csv_import::Recipe, window: &mut Window, cx: &mut Context<Self>) {
+        let conn = self.projects.borrow().iter().find(|p| p.key == key).and_then(|p| p.connections.connections.iter().find(|c| c.params(None).file_path == recipe.database).cloned());
+        let Some(conn) = conn else { error(window, cx, "The imported database is missing"); return; };
+        self.sidebar.update(cx, |s, cx| { s.refresh_connection(&conn.key(), cx); s.show_table(&conn, &recipe.table, cx); });
+        let sql = format!("SELECT * FROM {} LIMIT 100;", nbq_driver::csv_import::quote(&recipe.table));
+        let tab = self.new_tab(Some(conn), Some(key), window, cx);
+        tab.update(cx, |t, cx| { t.editor.update(cx, |e, cx| e.set_value(sql, window, cx)); t.run_statement(cx); });
+    }
+
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let store = match std::env::var_os("NBQ_CONFIG_DIR") {
             Some(d) => Store::new(PathBuf::from(d)),
@@ -152,6 +243,8 @@ impl Workbench {
             close_armed: None,
             quit_dialog_open: false,
             closing: false,
+            csv_queue: Default::default(),
+            csv_target: None,
             palette,
             focus: cx.focus_handle(),
             _tasks: vec![events, watch],
@@ -159,6 +252,7 @@ impl Workbench {
         };
         let first = wb.projects.borrow().first().and_then(|p| p.connections.connections.first().cloned());
         wb.new_tab(first, None, window, cx);
+        wb.check_csv_sources(window, cx);
         // The component Root is attached by open_window only after this builder
         // returns. Notifications need its WindowState, even though init ran.
         window.defer(cx, move |window, cx| {
@@ -411,6 +505,20 @@ impl Workbench {
                 }
                 self.new_tab(c, project, window, cx);
             }
+            SidebarEvent::ReloadCsv(p) => self.open_csv(p.clone(), true, window, cx),
+            SidebarEvent::ImportCsvFile(p) => self.open_csv_options(p.clone(), false, true, window, cx),
+            SidebarEvent::ImportFiles { paths, connection: key } => {
+                let conn = connection(&self.projects.borrow(), key);
+                if let Some(conn) = conn.filter(|c| c.kind.is_file_based()) { self.csv_batch(paths.clone(), Some(conn.params(None).file_path), window, cx); }
+                else { error(window, cx, "CSV imports require SQLite or DuckDB"); }
+            }
+            SidebarEvent::ShowCsvTable(path) => {
+                let projects = self.projects.borrow();
+                if let Some((conn, table)) = projects.iter().find_map(|p| p.local.csv_imports.iter().rev().find(|r| p.root.join(&r.source) == *path).and_then(|r| p.connections.connections.iter().find(|c| c.params(None).file_path == p.root.join(&r.database)).map(|c| (c.clone(), r.table.clone())))) {
+                    drop(projects);
+                    self.sidebar.update(cx, |s, cx| s.show_table(&conn, &table, cx));
+                }
+            }
             SidebarEvent::OpenScript(p) => self.open_path(p.clone(), window, cx),
             SidebarEvent::NewConnection { project, folder } => {
                 self.edit_connection(*project, None, folder.clone(), window, cx)
@@ -629,6 +737,7 @@ impl Workbench {
         if changed.is_empty() {
             return;
         }
+        if changed.iter().any(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("csv"))) { self.check_csv_sources(window, cx); }
         let mut reloaded = Vec::new();
         for p in self.projects.borrow_mut().iter_mut() {
             if changed.iter().any(|c| p.is_relevant_change(c)) {
@@ -763,6 +872,7 @@ impl Workbench {
     // ---- files ----
 
     fn open_path(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("csv")) { self.open_csv(path, false, window, cx); return; }
         if let Some(ix) = self.tabs.iter().position(|t| t.read(cx).path.as_ref() == Some(&path)) {
             self.active = ix;
             self.focus_editor(window, cx);
@@ -928,6 +1038,8 @@ impl Workbench {
             self.save(false, window, cx);
         } else if a.is::<SaveFileAs>() {
             self.save(true, window, cx);
+        } else if a.is::<ImportCsv>() {
+            self.pick_csv(window, cx);
         } else if a.is::<OpenFile>() {
             self.open_dialog_file(window, cx);
         } else if a.is::<ExportCsv>() {
@@ -1122,6 +1234,9 @@ impl Render for Workbench {
             .and_then(|k| crate::ui::project(&self.projects.borrow(), k).map(|p| p.name().to_string()));
         let root = v_flex()
             .id("workbench")
+            .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
+                this.csv_batch(paths.paths().to_vec(), None, window, cx);
+            }))
             .key_context("Workbench")
             .track_focus(&self.focus)
             .size_full()
@@ -1129,7 +1244,7 @@ impl Render for Workbench {
             .text_color(theme.foreground);
         let root = bind!(
             root, cx, RunStatement, RunScript, CancelQuery, Commit, Rollback, ToggleAutocommit, NewTab, CloseTab,
-            NextTab, PrevTab, SaveFile, SaveFileAs, OpenFile, ExportCsv, CopyCell, NewConnection, NewProject, OpenProject,
+            NextTab, PrevTab, SaveFile, SaveFileAs, OpenFile, ImportCsv, ExportCsv, CopyCell, NewConnection, NewProject, OpenProject,
             CommandPalette, FocusEditor,
             ToggleTheme
         );

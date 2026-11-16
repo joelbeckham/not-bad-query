@@ -48,6 +48,9 @@ pub struct ProjectMeta {
 pub struct LocalState {
     /// Script path (relative to `scripts/`, `/`-separated) → connection id.
     pub script_connections: BTreeMap<String, String>,
+    /// Automatically discovered database paths, relative to the project, to stable ids.
+    pub database_ids: BTreeMap<String, String>,
+    pub csv_imports: Vec<nbq_driver::csv_import::Recipe>,
 }
 
 #[derive(Debug, Clone)]
@@ -162,7 +165,8 @@ impl Project {
         let mut seen = HashSet::new();
         let mut warnings = Vec::new();
         let mut conns = Vec::new();
-        for (path, folder) in found {
+        let database_files: Vec<_> = found.iter().filter(|(p, _)| !p.extension().is_some_and(|x| x.eq_ignore_ascii_case("toml"))).cloned().collect();
+        for (path, folder) in found.into_iter().filter(|(p, _)| p.extension().is_some_and(|x| x.eq_ignore_ascii_case("toml"))) {
             let name = path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
             let text = match std::fs::read_to_string(&path) {
                 Ok(t) => t,
@@ -190,6 +194,26 @@ impl Project {
             self.stamp(&mut c);
             conns.push(c);
         }
+        let mut changed = false;
+        for (path, folder) in database_files {
+            let canonical = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+            if conns.iter().any(|c| c.kind.is_file_based() && std::fs::canonicalize(c.params(None).file_path).ok().as_ref() == Some(&canonical)) { continue; }
+            let previous_kind = self.connections.connections.iter().find(|c| c.kind.is_file_based() && c.params(None).file_path == path).map(|c| c.kind)
+                .or_else(|| self.local.csv_imports.iter().find(|r| self.root.join(&r.database) == path).map(|r| r.engine));
+            let kind = match previous_kind.map(Ok).unwrap_or_else(|| database_kind(&path)) {
+                Ok(kind) => kind,
+                Err(e) => { warnings.push(format!("{}: {e}", path.display())); continue; }
+            };
+            let relative = path.strip_prefix(&self.root).unwrap_or(&path).to_string_lossy().replace('\\', "/");
+            let id = self.local.database_ids.entry(relative.clone()).or_insert_with(|| { changed = true; uuid::Uuid::new_v4().to_string() }).clone();
+            let mut c = Connection::new(path.file_name().unwrap_or_default().to_string_lossy(), kind);
+            c.id = id;
+            c.folder = folder;
+            c.file_path = PathBuf::from(relative);
+            self.stamp(&mut c);
+            conns.push(c);
+        }
+        if changed { self.save_local()?; }
         self.connections = Connections { folders, connections: conns };
         self.warnings = warnings;
         Ok(())
@@ -199,6 +223,12 @@ impl Project {
         c.project_key = self.key;
         c.project_id = self.meta.id.clone();
         c.project_root = self.root.clone();
+    }
+
+    pub fn save_local(&self) -> Result<()> {
+        let dir = self.root.join(LOCAL_DIR);
+        std::fs::create_dir_all(&dir).map_err(io_err(&dir))?;
+        write_atomic(&dir.join(LOCAL_FILE), &toml::to_string_pretty(&self.local)?)
     }
 
     fn conn_path(&self, folder: Option<&str>, name: &str) -> PathBuf {
@@ -242,6 +272,9 @@ impl Project {
     pub fn delete_connection(&mut self, id: &str) -> Result<()> {
         if let Some(c) = self.connections.get(id) {
             let path = self.connection_file(c);
+            if self.local.database_ids.values().any(|saved| saved == id) && !path.is_file() {
+                return Err(ConfigError::Project("This connection comes from a database file. Move the file out of connections/ to remove it from the tree.".into()));
+            }
             match std::fs::remove_file(&path) {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -322,10 +355,21 @@ fn scan_connections(
             };
             folders.push(sub.clone());
             scan_connections(&p, Some(&sub), out, folders, depth + 1);
-        } else if p.extension().is_some_and(|x| x.eq_ignore_ascii_case("toml")) {
+        } else if p.extension().is_some_and(|x| ["toml", "db", "sqlite", "sqlite3", "duckdb", "ddb"].iter().any(|ext| x.eq_ignore_ascii_case(ext))) {
             out.push((p, folder.map(str::to_string)));
         }
     }
+}
+
+/// Inspect headers because both engines commonly use `.db`.
+fn database_kind(path: &Path) -> std::io::Result<nbq_driver::DbKind> {
+    use std::io::Read;
+    let mut header = [0; 16];
+    let n = std::fs::File::open(path)?.read(&mut header)?;
+    if n >= 16 && &header == b"SQLite format 3\0" { return Ok(nbq_driver::DbKind::Sqlite); }
+    if n >= 12 && &header[8..12] == b"DUCK" { return Ok(nbq_driver::DbKind::DuckDb); }
+    if n == 0 && path.extension().is_some_and(|x| ["db", "sqlite", "sqlite3"].iter().any(|e| x.eq_ignore_ascii_case(e))) { return Ok(nbq_driver::DbKind::Sqlite); }
+    Err(std::io::Error::other("Unrecognized database file"))
 }
 
 #[cfg(test)]
@@ -355,6 +399,29 @@ mod tests {
             assert_eq!(stored.params(None).file_path, project.root.join("data/local.db"));
             assert_eq!(stored.kind, kind);
         }
+    }
+
+    #[test]
+    fn database_files_are_discovered_and_profiles_do_not_duplicate_them() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/discovery-tests");
+        std::fs::create_dir_all(&root).unwrap();
+        let dir = tempfile::tempdir_in(root).unwrap();
+        let mut project = Project::create(dir.path(), "files").unwrap();
+        for (name, kind) in [("sqlite.db", DbKind::Sqlite), ("duck.db", DbKind::DuckDb)] {
+            let path = project.connections_dir().join(name);
+            nbq_driver::create_database(kind, &path).unwrap();
+        }
+        project.reload().unwrap();
+        assert_eq!(project.connections.connections.len(), 2);
+        let first = project.connections.connections.clone();
+        project.reload().unwrap();
+        assert_eq!(first, project.connections.connections);
+        assert_eq!(project.connections.connections.iter().find(|c| c.name == "duck.db").unwrap().kind, DbKind::DuckDb);
+        let mut profile = Connection::new("Named", DbKind::DuckDb);
+        profile.file_path = "connections/duck.db".into();
+        project.save_connection(profile).unwrap();
+        project.reload().unwrap();
+        assert_eq!(project.connections.connections.len(), 2);
     }
 
     #[test]

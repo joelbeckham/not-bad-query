@@ -5,6 +5,7 @@ mod actions;
 mod app_icon;
 mod complete;
 mod conn_dialog;
+mod csv_dialog;
 mod grid;
 mod query_tab;
 mod sidebar;

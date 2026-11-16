@@ -180,6 +180,40 @@ discarding pending writes. Running queries use DuckDB's interrupt handle. An
 execution error that aborts a manual transaction triggers rollback and clears the
 tab's transaction state; errors that leave the transaction usable preserve it.
 
+## CSV snapshots
+
+CSV files in `scripts/` appear alongside SQL files. Double-click imports a new
+snapshot or opens a query on the linked table. The link icon selects that table;
+its refresh variant indicates a changed or missing source. The context menu
+provides import, reload, and table navigation. The Import CSV command and desktop
+file drops use the same dialog. Multiple files are reviewed in sequence, sharing
+the destination chosen for the first file; dropping onto a file connection
+preselects that database. Windows shell integration is not installed.
+
+The dialog defaults to DuckDB, offers SQLite, detects the delimiter, previews
+sample values, and allows header, column-name, and TEXT/BIGINT/DOUBLE overrides.
+Leading-zero identifiers infer as text; empty fields import as NULL. New database
+files go under `connections/`. Existing databases receive a new table without
+overwriting a name collision.
+
+The engine reads CSV rows on a blocking worker and sends bounded batches through
+a channel to a dedicated session. Import and reload run in a transaction. Reload
+deletes and replaces only the imported table's rows, retaining its schema and
+indexes; parse, type, header, and cancellation failures roll back the operation.
+The original CSV is never changed. Reload replaces any subsequent edits to the
+imported rows. It never runs automatically.
+
+Import recipes live in `.not-bad-query/local.toml`: source and destination paths
+(project-relative where possible), engine, table, parsing settings, column types,
+original headers, import time, and source size/modification time. Recipe writes
+and source-change checks run through the engine off the UI thread.
+
+SQLite (`.db`, `.sqlite`, `.sqlite3`) and DuckDB (`.db`, `.duckdb`, `.ddb`) files
+under `connections/` are discovered recursively. File headers distinguish engines
+when extensions overlap; active connections retain their known kind. Generated
+connection ids are persisted in local state. Explicit profiles referencing the
+same canonical file take precedence, avoiding duplicate tree entries.
+
 ## TLS and scripts
 
 New connections default to `verify-full`: certificate-chain and hostname validation

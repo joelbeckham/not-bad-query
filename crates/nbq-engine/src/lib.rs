@@ -9,6 +9,7 @@
 mod fetch;
 pub mod meta;
 mod tab;
+pub mod csv_import;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -137,6 +138,49 @@ pub struct Engine {
 }
 
 impl Engine {
+    pub fn csv_source_changes(&self, root: PathBuf, recipes: Vec<nbq_driver::csv_import::Recipe>) -> tokio::sync::oneshot::Receiver<Vec<PathBuf>> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.rt().spawn_blocking(move || {
+            let mut seen = std::collections::HashSet::new();
+            let paths = recipes.iter().rev().filter_map(|r| {
+                let path = root.join(&r.source);
+                if !seen.insert(path.clone()) { return None; }
+                let changed = std::fs::metadata(&path).map(|m| m.len() != r.source_size || m.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_nanos() as u64) != r.source_modified).unwrap_or(true);
+                changed.then_some(path)
+            }).collect();
+            let _ = tx.send(paths);
+        });
+        rx
+    }
+    pub fn record_csv_import(&self, mut project: nbq_core::Project, recipe: nbq_driver::csv_import::Recipe) -> tokio::sync::oneshot::Receiver<Result<nbq_core::Project, String>> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.rt().spawn_blocking(move || {
+            let result = (|| {
+                let mut stored = recipe;
+                stored.source = stored.source.strip_prefix(&project.root).unwrap_or(&stored.source).to_path_buf();
+                stored.database = stored.database.strip_prefix(&project.root).unwrap_or(&stored.database).to_path_buf();
+                project.local.csv_imports.retain(|r| !(r.database == stored.database && r.table == stored.table));
+                project.local.csv_imports.push(stored);
+                project.save_local().and_then(|_| project.reload()).map_err(|e| e.to_string())?;
+                Ok(project)
+            })();
+            let _ = tx.send(result);
+        });
+        rx
+    }
+    pub fn preview_csv(&self, path: PathBuf, delimiter: Option<u8>, headers: bool) -> tokio::sync::oneshot::Receiver<Result<nbq_driver::csv_import::Preview, String>> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.rt().spawn_blocking(move || { let _ = tx.send(nbq_driver::csv_import::preview(&path, delimiter, headers)); });
+        rx
+    }
+
+    pub fn import_csv(&self, recipe: nbq_driver::csv_import::Recipe, create: bool, reload: bool) -> (csv_import::ImportProgress, tokio::sync::oneshot::Receiver<Result<nbq_driver::csv_import::Recipe, String>>) {
+        let progress = csv_import::ImportProgress::default();
+        let worker = progress.clone();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.rt().spawn(async move { let _ = tx.send(csv_import::run(recipe, create, reload, worker).await); });
+        (progress, rx)
+    }
     pub fn new(opts: EngineOptions) -> (Arc<Engine>, mpsc::UnboundedReceiver<Event>) {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)

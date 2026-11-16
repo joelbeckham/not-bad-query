@@ -4470,6 +4470,7 @@ dependencies = [
  "arrow-schema",
  "async-trait",
  "chrono",
+ "csv",
  "duckdb",
  "futures",
  "nbq-sql",
@@ -4494,6 +4495,7 @@ name = "nbq-engine"
 version = "0.1.0"
 dependencies = [
  "arrow-schema",
+ "nbq-core",
  "nbq-driver",
  "nbq-results",
  "nbq-sql",

@@ -24,6 +24,7 @@ pub mod display;
 pub mod pg;
 pub mod sqlite;
 pub mod duckdb;
+pub mod csv_import;
 
 pub use nbq_sql::Dialect;
 

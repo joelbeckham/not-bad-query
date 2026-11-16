@@ -1,3 +1,8 @@
 # not-bad-query: per-user state and exports stay out of git
 .not-bad-query/
 exports/
+connections/**/*.duckdb
+connections/**/*.duckdb.wal
+connections/**/*.sqlite
+connections/**/*.sqlite-wal
+connections/**/*.sqlite-shm

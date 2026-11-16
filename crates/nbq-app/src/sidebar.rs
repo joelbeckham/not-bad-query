@@ -27,6 +27,10 @@ pub enum SidebarEvent {
     Connect(String),
     Disconnect(String),
     OpenScript(PathBuf),
+    ReloadCsv(PathBuf),
+    ShowCsvTable(PathBuf),
+    ImportCsvFile(PathBuf),
+    ImportFiles { paths: Vec<PathBuf>, connection: String },
     NewConnection { project: u32, folder: Option<String> },
     EditConnection(String),
     DeleteConnection(String),
@@ -102,6 +106,8 @@ pub struct Sidebar {
     expanded: HashSet<SharedString>,
     /// Projects already shown once (new ones start expanded).
     seen: HashSet<u32>,
+    reveal_table: Option<(String, String)>,
+    csv_changes: HashMap<u32, HashSet<PathBuf>>,
     _subs: Vec<Subscription>,
 }
 
@@ -147,6 +153,8 @@ impl Sidebar {
             disconnected: HashSet::new(),
             expanded: HashSet::new(),
             seen: HashSet::new(),
+            reveal_table: None,
+            csv_changes: Default::default(),
             _subs: subs,
         };
         s.refresh(cx);
@@ -193,6 +201,32 @@ impl Sidebar {
         self.disconnected.remove(key);
     }
 
+    pub fn set_csv_changes(&mut self, project: u32, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
+        self.csv_changes.insert(project, paths.into_iter().collect()); cx.notify();
+    }
+
+    pub fn show_table(&mut self, conn: &nbq_core::Connection, table: &str, cx: &mut Context<Self>) {
+        self.reveal_table = Some((conn.key(), table.into()));
+        self.expanded.insert(project_id(conn.project_key));
+        self.expanded.insert(section_id(conn.project_key, false));
+        if let Some(folder) = &conn.folder {
+            let mut path = String::new();
+            for part in folder.split('/') { if !path.is_empty() { path.push('/'); } path.push_str(part); self.expanded.insert(format!("f:{}:{path}", conn.project_key).into()); }
+        }
+        self.expand_reveal(cx);
+    }
+
+    fn expand_reveal(&mut self, cx: &mut Context<Self>) {
+        let Some((conn, table)) = self.reveal_table.clone() else { return; };
+        let ids = [format!("c:{conn}").into(), obj_id(&conn, &ObjPath::Schema("main".into())), obj_id(&conn, &ObjPath::Folder { schema: "main".into(), kind: ObjKind::Table })];
+        for id in &ids { self.expanded.insert(id.clone()); }
+        self.rebuild(cx);
+        for id in &ids { self.ensure_loaded(id); }
+        let target = obj_id(&conn, &ObjPath::Object { schema: "main".into(), name: table, kind: ObjKind::Table });
+        let found = self.tree.update(cx, |t, cx| { if let Some(item) = find(t, &target) { t.set_selected_item(Some(&item), cx); true } else { false } });
+        if found { self.reveal_table = None; }
+    }
+
     pub fn is_disconnected(&self, key: &str) -> bool {
         self.disconnected.contains(key)
     }
@@ -233,6 +267,7 @@ impl Sidebar {
         }
         self.loaded.insert(key, items);
         self.rebuild(cx);
+        self.expand_reveal(cx);
     }
 
     fn on_tree(&mut self, ev: &TreeEvent, cx: &mut Context<Self>) {
@@ -536,6 +571,15 @@ impl Sidebar {
             }
             Some(Node::Script(path)) => {
                 let p2 = path.clone();
+                let reload = path.clone();
+                let show = path.clone();
+                let import = path.clone();
+                let linked = self.projects.borrow().iter().any(|p| p.local.csv_imports.iter().any(|r| p.root.join(&r.source) == path));
+                let menu = if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("csv")) {
+                    menu.item(item("Import CSV…", IconName::Plus).on_click(emit(Rc::new(move || SidebarEvent::ImportCsvFile(import.clone())))))
+                        .item(item("Reload from CSV", IconName::RefreshCw).disabled(!linked).on_click(emit(Rc::new(move || SidebarEvent::ReloadCsv(reload.clone())))))
+                        .item(item("Show imported table", IconName::ArrowRight).disabled(!linked).on_click(emit(Rc::new(move || SidebarEvent::ShowCsvTable(show.clone())))))
+                } else { menu };
                 menu.item(item("Open", IconName::File).on_click(emit(Rc::new(move || SidebarEvent::OpenScript(p2.clone())))))
                     .item(reveal_item(path.parent().map(Path::to_path_buf).unwrap_or_default()))
             }
@@ -650,7 +694,7 @@ fn scan_scripts(dir: &Path, depth: usize) -> Vec<ScriptEntry> {
         }
         if p.is_dir() {
             dirs.push((name, p));
-        } else if p.extension().is_some_and(|x| x.eq_ignore_ascii_case("sql")) {
+        } else if p.extension().is_some_and(|x| x.eq_ignore_ascii_case("sql") || x.eq_ignore_ascii_case("csv")) {
             files.push((name, p));
         }
     }
@@ -719,15 +763,31 @@ impl Render for Sidebar {
             self.render_empty(cx)
         } else {
             let (v, n) = (view.clone(), nodes.clone());
+            let linked: HashMap<PathBuf, String> = self.projects.borrow().iter().flat_map(|p| p.local.csv_imports.iter().map(|r| (p.root.join(&r.source), format!("{} · {}", r.database.display(), r.table)))).collect();
+            let changed: HashSet<PathBuf> = self.csv_changes.values().flatten().cloned().collect();
             tree(&self.tree, move |ix, entry, selected, _, cx| {
                 let id = entry.item().id.clone();
                 let el = Sidebar::render_item(&n, &id, entry.item().label.clone(), entry.is_folder().then(|| entry.is_expanded()), cx);
+                let badge = match n.get(&id) {
+                    Some(Node::Script(path)) => linked.get(path).map(|tip| {
+                        let path = path.clone(); let is_changed = changed.contains(&path); let tip = if is_changed { format!("{tip} — Source changed since import") } else { tip.clone() }; let view = v.clone();
+                        Button::new(("csv-link", ix)).ghost().xsmall().icon(if is_changed { Lucide::RefreshCw } else { Lucide::Link }).tooltip(tip)
+                            .on_click(move |_, _, cx| { cx.stop_propagation(); view.update(cx, |_, cx| cx.emit(SidebarEvent::ShowCsvTable(path.clone()))); })
+                    }),
+                    _ => None,
+                };
                 let view = v.clone();
+                let drop_view = v.clone();
+                let drop_conn = match n.get(&id) { Some(Node::Conn { key, .. }) => Some(key.clone()), _ => None };
                 ListItem::new(ix)
                     .selected(selected)
                     .py_0p5()
                     .pl(px(14.) * entry.depth() + px(8.))
-                    .child(el)
+                    .child(h_flex().w_full().child(div().flex_1().min_w_0().child(el)).when_some(badge, |row, badge| row.child(badge)))
+                    .when_some(drop_conn, |row, key| row.on_drop(move |paths: &ExternalPaths, _, cx| {
+                        cx.stop_propagation();
+                        drop_view.update(cx, |_, cx| cx.emit(SidebarEvent::ImportFiles { paths: paths.paths().to_vec(), connection: key.clone() }));
+                    }))
                     .on_click(move |ev: &ClickEvent, _, cx| {
                         if ev.click_count() == 2 {
                             view.update(cx, |s, cx| s.activate(&id, cx));

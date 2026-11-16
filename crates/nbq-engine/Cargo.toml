@@ -8,6 +8,7 @@ publish.workspace = true
 
 [dependencies]
 nbq-sql.workspace = true
+nbq-core.workspace = true
 nbq-driver.workspace = true
 nbq-results.workspace = true
 tokio.workspace = true
