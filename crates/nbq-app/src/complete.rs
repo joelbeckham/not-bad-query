@@ -20,6 +20,7 @@ pub struct SqlCompleter {
     pub catalogs: Catalogs,
     /// The owning tab's connection id.
     pub conn: Rc<RefCell<Option<String>>>,
+    pub dialect: Rc<std::cell::Cell<Dialect>>,
 }
 
 const MAX_ITEMS: usize = 200;
@@ -46,8 +47,13 @@ fn rank(name: &str, prefix: &str) -> Option<u8> {
 }
 
 /// Matching items plus the byte range they replace (the identifier being typed).
+#[cfg(test)]
 pub fn items_for(tables: &[CatalogTable], text: &str, offset: usize) -> (Vec<CompletionItem>, std::ops::Range<usize>) {
-    let Some(ctx) = completion_context(text, offset, SplitOptions::new(Dialect::Postgres)) else {
+    items_for_dialect(tables, text, offset, Dialect::Postgres)
+}
+
+fn items_for_dialect(tables: &[CatalogTable], text: &str, offset: usize, dialect: Dialect) -> (Vec<CompletionItem>, std::ops::Range<usize>) {
+    let Some(ctx) = completion_context(text, offset, SplitOptions::new(dialect)) else {
         return (Vec::new(), offset..offset);
     };
     let eq = |a: &str, b: &str| a.eq_ignore_ascii_case(b);
@@ -60,7 +66,7 @@ pub fn items_for(tables: &[CatalogTable], text: &str, offset: usize) -> (Vec<Com
                     continue;
                 }
                 // Unqualified: public tables by bare name, others as schema.table.
-                let label = if schema.is_some() || t.schema == "public" {
+                let label = if schema.is_some() || t.schema == "public" || (dialect == Dialect::Sqlite && t.schema == "main") {
                     ident(&t.name)
                 } else {
                     format!("{}.{}", ident(&t.schema), ident(&t.name))
@@ -137,7 +143,7 @@ impl CompletionProvider for SqlCompleter {
     ) -> Task<anyhow::Result<CompletionResponse>> {
         let tables = self.conn.borrow().as_ref().and_then(|c| self.catalogs.borrow().get(c).cloned());
         let Some(tables) = tables else { return Task::ready(Ok(CompletionResponse::Array(Vec::new()))) };
-        let (mut items, replace) = items_for(&tables, &text.to_string(), offset);
+        let (mut items, replace) = items_for_dialect(&tables, &text.to_string(), offset, self.dialect.get());
         // Replace exactly the identifier being typed (not a qualifier like `o.`).
         let range = lsp_types::Range { start: text.offset_to_position(replace.start), end: text.offset_to_position(replace.end) };
         for it in &mut items {
@@ -154,6 +160,14 @@ impl CompletionProvider for SqlCompleter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[::core::prelude::v1::test]
+    fn sqlite_main_tables_complete_without_schema_prefix() {
+        let tables = vec![CatalogTable { schema: "main".into(), name: "orders".into(), kind: ObjKind::Table, columns: vec![("id".into(), "INTEGER".into())] }];
+        let sql = "select * from ord";
+        let (items, _) = items_for_dialect(&tables, sql, sql.len(), Dialect::Sqlite);
+        assert!(items.iter().any(|i| i.label == "orders"));
+    }
 
     fn cat() -> Vec<CatalogTable> {
         let t = |schema: &str, name: &str, cols: &[&str]| CatalogTable {

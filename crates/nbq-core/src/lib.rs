@@ -55,8 +55,14 @@ pub struct Connection {
     #[serde(skip)]
     pub folder: Option<String>,
     pub kind: DbKind,
+    /// File-backed database path, absolute or relative to the project root.
+    #[serde(default, skip_serializing_if = "path_is_empty")]
+    pub file_path: PathBuf,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub host: String,
+    #[serde(default, skip_serializing_if = "is_zero")]
     pub port: u16,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub database: String,
     #[serde(default)]
     pub ssl: SslMode,
@@ -74,7 +80,12 @@ pub struct Connection {
     /// The owning project's stable id.
     #[serde(skip)]
     pub project_id: String,
+    #[serde(skip)]
+    pub project_root: PathBuf,
 }
+
+fn path_is_empty(path: &Path) -> bool { path.as_os_str().is_empty() }
+fn is_zero(port: &u16) -> bool { *port == 0 }
 
 fn yes() -> bool {
     true
@@ -87,14 +98,17 @@ impl Connection {
             name: name.into(),
             folder: None,
             kind,
-            host: "localhost".into(),
+            file_path: PathBuf::new(),
+            host: if kind.is_file_based() { String::new() } else { "localhost".into() },
             port: match kind {
                 DbKind::Postgres => 5432,
                 DbKind::Redshift => 5439,
+                DbKind::Sqlite => 0,
             },
             database: match kind {
                 DbKind::Postgres => "postgres".into(),
                 DbKind::Redshift => "dev".into(),
+                DbKind::Sqlite => String::new(),
             },
             ssl: SslMode::VerifyFull,
             ssl_root_cert: String::new(),
@@ -102,6 +116,7 @@ impl Connection {
             autocommit: true,
             project_key: 0,
             project_id: String::new(),
+            project_root: PathBuf::new(),
         }
     }
 
@@ -123,6 +138,7 @@ impl Connection {
         let creds = creds.unwrap_or_default();
         ConnectParams {
             kind: self.kind,
+            file_path: if self.kind.is_file_based() && self.file_path.is_relative() { self.project_root.join(&self.file_path) } else { self.file_path.clone() },
             host: self.host.clone(),
             port: self.port,
             database: self.database.clone(),

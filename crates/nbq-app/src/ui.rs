@@ -42,6 +42,7 @@ pub fn rgb_hsla(v: u32) -> Hsla {
 
 /// Stored credentials for a connection.
 pub fn credentials(c: &Connection) -> Option<Credentials> {
+    if c.kind.is_file_based() { return None; }
     let stored = nbq_core::secrets::get(&c.secret_key()).ok().flatten();
     // Debug builds: dev credentials from the environment (with NBQ_CONFIG_DIR,
     // for local testing without touching the OS credential store).

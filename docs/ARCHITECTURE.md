@@ -141,6 +141,28 @@ its implicit statement transaction until completion or cancellation.
   session drop. PostgreSQL itself rolls back any open transaction when a session
   terminates ([protocol documentation](https://www.postgresql.org/docs/current/protocol-flow.html)).
 
+## File-backed databases
+
+SQLite profiles use `kind = "sqlite"` and `file_path = "data/local.db"`.
+Relative paths resolve against the owning project's root, independently of the
+connection file's folder or the app's working directory. The shared file-database
+dialog offers **Open existing** and **Create new**, with native file pickers.
+Creation happens explicitly on Save and atomically reserves a new filename;
+opening and reconnecting never create missing files. SQLite does not use the
+credential store or server/TLS fields.
+
+`DbKind::is_file_based`, `file_extensions`, `ConnectParams::file`, and the engine's
+`prepare_database_file` keep the file workflow reusable for a future DuckDB driver.
+Each SQLite session owns a dedicated blocking worker, including its connection
+and prepared statements. Arrow batches are requested on demand, bounded by the
+same value/row/batch limits as server drivers. SQLite's dynamic storage classes
+are rendered into stable Arrow text columns, preserving integers, floats, text,
+NULLs, and hexadecimal blobs even when a column mixes types. Metadata queries
+use SQLite's schema and pragma interfaces for tables, views, columns, indexes,
+triggers, and autocomplete. Interrupt handles support cancellation; savepoints
+preserve manual transactions after ordinary errors, and the engine reconciles
+transaction state if SQLite rolls back the entire transaction after an error.
+
 ## TLS and scripts
 
 New connections default to `verify-full`: certificate-chain and hostname validation

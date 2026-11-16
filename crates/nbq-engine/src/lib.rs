@@ -161,6 +161,22 @@ impl Engine {
         self.next_id.fetch_add(1, Ordering::Relaxed)
     }
 
+    /// Validate an existing file or explicitly create a new one off the UI thread.
+    pub fn prepare_database_file(&self, kind: nbq_driver::DbKind, path: PathBuf, create: bool) -> tokio::sync::oneshot::Receiver<Result<(), DriverError>> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.rt().spawn(async move {
+            let result = if create {
+                tokio::task::spawn_blocking(move || nbq_driver::create_database(kind, &path)).await
+                    .unwrap_or_else(|e| Err(DriverError::connection(e.to_string())))
+            } else {
+                let params = ConnectParams::file(kind, path);
+                nbq_driver::connect(&params).await.map(|_| ())
+            };
+            let _ = tx.send(result);
+        });
+        rx
+    }
+
     pub fn open_tab(&self) -> TabId {
         let id = TabId(self.id());
         if self.shutting_down.load(Ordering::Acquire) { return id; }

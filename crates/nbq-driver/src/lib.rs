@@ -22,6 +22,7 @@ pub const TARGET_BATCH_BYTES: usize = 4 * 1024 * 1024;
 
 pub mod display;
 pub mod pg;
+pub mod sqlite;
 
 pub use nbq_sql::Dialect;
 
@@ -78,6 +79,7 @@ impl ColumnKind {
 pub enum DbKind {
     Postgres,
     Redshift,
+    Sqlite,
 }
 
 impl DbKind {
@@ -85,7 +87,15 @@ impl DbKind {
         match self {
             DbKind::Postgres => Dialect::Postgres,
             DbKind::Redshift => Dialect::Redshift,
+            DbKind::Sqlite => Dialect::Sqlite,
         }
+    }
+
+    /// File-backed engines share the connection dialog and path configuration.
+    pub fn is_file_based(self) -> bool { matches!(self, Self::Sqlite) }
+
+    pub fn file_extensions(self) -> &'static [&'static str] {
+        match self { Self::Sqlite => &["db", "sqlite", "sqlite3"], _ => &[] }
     }
 }
 
@@ -105,6 +115,8 @@ pub enum SslMode {
 #[derive(Debug, Clone)]
 pub struct ConnectParams {
     pub kind: DbKind,
+    /// Absolute path for file-backed engines. Opening never creates a file.
+    pub file_path: std::path::PathBuf,
     pub host: String,
     pub port: u16,
     pub database: String,
@@ -116,6 +128,12 @@ pub struct ConnectParams {
     pub connect_timeout: Duration,
     /// Shown in `pg_stat_activity.application_name` and similar.
     pub application_name: String,
+}
+
+impl ConnectParams {
+    pub fn file(kind: DbKind, path: impl Into<std::path::PathBuf>) -> Self {
+        Self { kind, file_path: path.into(), host: String::new(), port: 0, database: String::new(), user: String::new(), password: None, ssl: SslMode::Disable, ssl_root_cert: String::new(), connect_timeout: Duration::from_secs(10), application_name: "not-bad-query".into() }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -197,6 +215,8 @@ pub trait Session: Send {
     /// this by closing streams before issuing new statements.
     async fn execute(&mut self, sql: &str) -> Result<Execution>;
     fn is_closed(&self) -> bool;
+    /// Some embedded engines may roll back a transaction after interruption.
+    fn transaction_active(&self) -> Option<bool> { None }
     /// Last asynchronous connection error, if the driver can report it.
     fn closed_error(&self) -> Option<DriverError> { None }
     /// Install a server-side idle-transaction backstop where supported. Return
@@ -208,5 +228,14 @@ pub trait Session: Send {
 pub async fn connect(params: &ConnectParams) -> Result<Box<dyn Session>> {
     match params.kind {
         DbKind::Postgres | DbKind::Redshift => Ok(Box::new(pg::PgSession::connect(params).await?)),
+        DbKind::Sqlite => Ok(Box::new(sqlite::SqliteSession::connect(params).await?)),
+    }
+}
+
+/// Explicit file creation, separate from connecting so a typo cannot create a DB.
+pub fn create_database(kind: DbKind, path: &std::path::Path) -> Result<()> {
+    match kind {
+        DbKind::Sqlite => sqlite::create_database(path),
+        _ => Err(DriverError::connection("This engine does not use a database file")),
     }
 }

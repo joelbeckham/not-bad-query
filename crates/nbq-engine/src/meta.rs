@@ -12,6 +12,7 @@ use nbq_driver::{ConnectParams, DriverError, Execution, Session, display::cell_t
 use tokio::sync::{Mutex as AsyncMutex, mpsc, watch};
 
 use crate::{ConnState, Event};
+mod sqlite;
 
 /// Where in the object tree to list children.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -129,6 +130,7 @@ fn col(r: &[Option<String>], i: usize) -> String {
 }
 
 pub async fn list(s: &mut dyn Session, path: &ObjPath) -> Result<Vec<ObjItem>, DriverError> {
+    if s.dialect() == nbq_driver::Dialect::Sqlite { return sqlite::list(s, path).await; }
     let item = |name: String, kind, detail: Option<String>, has_children, path| ObjItem {
         name,
         kind,
@@ -312,6 +314,7 @@ fn approx_rows(n: u64) -> String {
 
 /// Every user relation with its columns, for autocomplete.
 pub async fn catalog(s: &mut dyn Session) -> Result<Vec<CatalogTable>, DriverError> {
+    if s.dialect() == nbq_driver::Dialect::Sqlite { return sqlite::catalog(s).await; }
     let rows = strings(
         s,
         "select n.nspname, c.relname, c.relkind::text, a.attname, format_type(a.atttypid, a.atttypmod) \
@@ -410,6 +413,7 @@ impl MetaConn {
 
     pub fn same_params(&self, p: &ConnectParams) -> bool {
         self.params.host == p.host
+            && self.params.file_path == p.file_path
             && self.params.port == p.port
             && self.params.database == p.database
             && self.params.user == p.user

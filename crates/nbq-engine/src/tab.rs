@@ -377,6 +377,10 @@ impl TabActor {
     }
 
     fn on_error(&mut self, e: &DriverError) {
+        if self.txn.in_txn && self.session.as_ref().is_some_and(|s| s.transaction_active() == Some(false)) {
+            self.reset_txn();
+            self.emit_txn();
+        }
         if e.kind == ErrorKind::Connection || self.session.as_ref().is_some_and(|s| s.is_closed()) {
             self.drop_session();
             self.emit(Event::Conn { tab: self.id, state: ConnState::Failed(e.clone()) });

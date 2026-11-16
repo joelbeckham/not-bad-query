@@ -24,6 +24,19 @@ struct H {
 }
 
 impl H {
+    async fn sqlite(autocommit: bool) -> H {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/sqlite-engine-tests");
+        std::fs::create_dir_all(&root).unwrap();
+        let dir = tempfile::tempdir_in(root).unwrap();
+        let params = ConnectParams::file(nbq_driver::DbKind::Sqlite, dir.path().join("local.db"));
+        nbq_driver::create_database(params.kind, &params.file_path).unwrap();
+        let (engine, rx) = Engine::new(EngineOptions::new(dir.path().join("spool")));
+        let tab = engine.open_tab();
+        engine.set_connection(tab, Some(params.clone()), autocommit);
+        let mut h = H { engine, rx, tab, params, dir, txn: None, fetch: Default::default() };
+        h.wait(|e| matches!(e, Event::Conn { state: ConnState::Connected, .. }).then_some(())).await;
+        h
+    }
     async fn new(app: &str, autocommit: bool) -> H {
         Self::with_timeout(app, autocommit, Duration::from_secs(900)).await
     }
@@ -132,6 +145,79 @@ impl H {
         p.application_name = "nbq-observer".into();
         nbq_driver::connect(&p).await.unwrap()
     }
+}
+
+#[tokio::test]
+async fn sqlite_transactions_pause_cancel_export_and_reconnect() {
+    let mut h = H::sqlite(false).await;
+    h.ok("create table t(id integer primary key)").await;
+    h.ok("insert into t values (1)").await;
+    let (_, events) = h.run("insert into t values (1)").await;
+    assert!(outcomes(&events).iter().any(|o| matches!(o, Outcome::Failed(_))));
+    h.ok("insert into t values (2)").await;
+    h.commit().await;
+    let (q, events) = h.run("with recursive n(x) as (values(1) union all select x+1 from n where x<1000000) select x from n").await;
+    assert!(h.paused_at(q).await < 10_000);
+    let spool = spool_of(&events);
+    h.engine.cancel(h.tab);
+    h.ended(q).await;
+    assert!(!spool.read(0..1).unwrap().is_empty());
+    h.ok("insert into t values (3)").await;
+    h.engine.rollback(h.tab);
+    h.txn = None;
+    h.txn_until(|t| !t.in_txn).await;
+    let mut obs = h.observer().await;
+    assert_eq!(scalar(&mut *obs, "select count(*) from t").await, "2");
+    let (q, events) = h.run("select id from t order by id").await;
+    let spool = spool_of(&events);
+    let path = h.dir.path().join("out.csv");
+    h.engine.export_csv(h.tab, q, spool, path.clone(), CsvOptions::default());
+    h.wait(|e| matches!(e, Event::Export { done: Some(Ok(())), .. }).then_some(())).await;
+    assert_eq!(std::fs::read_to_string(path).unwrap().replace('\r', ""), "id\n1\n2\n");
+    h.engine.set_connection(h.tab, None, true);
+    h.wait(|e| matches!(e, Event::Conn { state: ConnState::Disconnected, .. }).then_some(())).await;
+    h.engine.set_connection(h.tab, Some(h.params.clone()), true);
+    h.wait(|e| matches!(e, Event::Conn { state: ConnState::Connected, .. }).then_some(())).await;
+    h.ok("select * from t").await;
+}
+
+#[tokio::test]
+async fn sqlite_object_browser_and_catalog_quote_identifiers() {
+    use nbq_engine::meta::{self, ObjKind, ObjPath};
+    let h = H::sqlite(true).await;
+    let mut s = h.observer().await;
+    for sql in ["create table \"odd ' table\" (id integer primary key, value text, doubled text generated always as (value || value) virtual)", "create index idx_value on \"odd ' table\"(value)", "create view v as select id from \"odd ' table\"", "create trigger tr after insert on \"odd ' table\" begin select 1; end"] { s.execute(sql).await.unwrap(); }
+    let roots = meta::list(&mut *s, &ObjPath::Root).await.unwrap();
+    assert!(roots.iter().any(|i| i.name == "main"));
+    let folders = meta::list(&mut *s, &ObjPath::Schema("main".into())).await.unwrap();
+    assert_eq!(folders.len(), 2);
+    let tables = meta::list(&mut *s, &ObjPath::Folder { schema: "main".into(), kind: ObjKind::Table }).await.unwrap();
+    assert_eq!(tables.len(), 1);
+    let children = meta::list(&mut *s, tables[0].path.as_ref().unwrap()).await.unwrap();
+    assert!(children.iter().any(|i| i.name == "id" && i.key));
+    assert!(children.iter().any(|i| i.name == "doubled" && i.kind == ObjKind::Column));
+    assert!(children.iter().any(|i| i.name == "idx_value" && i.kind == ObjKind::Index));
+    assert!(children.iter().any(|i| i.name == "tr" && i.kind == ObjKind::Trigger));
+    let catalog = meta::catalog(&mut *s).await.unwrap();
+    assert_eq!(catalog.len(), 2);
+    assert_eq!(catalog.iter().find(|t| t.name == "odd ' table").unwrap().columns.len(), 3);
+}
+
+#[tokio::test]
+async fn sqlite_automatic_rollback_updates_engine_transaction_state() {
+    let mut h = H::sqlite(false).await;
+    h.ok("create table t(id integer primary key)").await;
+    h.commit().await;
+    h.ok("insert into t values (1)").await;
+    assert!(h.txn.unwrap().in_txn);
+    let (_, events) = h.run("insert or rollback into t values (1)").await;
+    assert!(outcomes(&events).iter().any(|o| matches!(o, Outcome::Failed(_))));
+    assert!(!h.txn.unwrap().in_txn);
+    assert_eq!(h.txn.unwrap().pending_writes, 0);
+    h.ok("insert into t values (2)").await;
+    h.commit().await;
+    let mut obs = h.observer().await;
+    assert_eq!(scalar(&mut *obs, "select sum(id) from t").await, "2");
 }
 
 fn outcomes(evs: &[Event]) -> Vec<Outcome> {

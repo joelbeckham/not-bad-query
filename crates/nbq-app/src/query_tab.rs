@@ -46,6 +46,7 @@ pub struct QueryTab {
     /// Where Save first suggests putting an untitled script.
     pub save_dir: Option<PathBuf>,
     completer_conn: Rc<RefCell<Option<String>>>,
+    completer_dialect: Rc<std::cell::Cell<nbq_sql::Dialect>>,
     pub editor: Entity<EditorState>,
     pub grid: Entity<TableState<ResultGrid>>,
     pub path: Option<PathBuf>,
@@ -80,10 +81,11 @@ impl QueryTab {
     ) -> Self {
         let engine_tab = engine.open_tab();
         let completer_conn = Rc::new(RefCell::new(None));
+        let completer_dialect = Rc::new(std::cell::Cell::new(nbq_sql::Dialect::Postgres));
         let editor = cx.new(|cx| {
             let mut s = EditorState::new(window, cx).language("sql").line_number(true).placeholder("select …");
             s.lsp_mut().completion_provider =
-                Some(Rc::new(SqlCompleter { catalogs, conn: completer_conn.clone() }));
+                Some(Rc::new(SqlCompleter { catalogs, conn: completer_conn.clone(), dialect: completer_dialect.clone() }));
             s
         });
         let grid = cx.new(|cx| TableState::new(ResultGrid::new(engine.clone(), engine_tab, settings.initial_rows), window, cx).cell_selectable(true));
@@ -107,6 +109,7 @@ impl QueryTab {
             project: None,
             save_dir: None,
             completer_conn,
+            completer_dialect,
             editor,
             grid,
             path: None,
@@ -156,6 +159,7 @@ impl QueryTab {
         let params = conn.as_ref().map(crate::ui::params_for);
         let autocommit = conn.as_ref().map(|c| c.autocommit).unwrap_or(true);
         *self.completer_conn.borrow_mut() = conn.as_ref().map(|c| c.key());
+        self.completer_dialect.set(conn.as_ref().map(|c| c.kind.dialect()).unwrap_or(nbq_sql::Dialect::Postgres));
         self.engine.set_connection(self.engine_tab, params, autocommit);
         if let Some(c) = &conn {
             self.project = Some(c.project_key);

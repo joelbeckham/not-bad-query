@@ -679,7 +679,8 @@ impl Workbench {
     ) {
         let user = existing.as_ref().and_then(crate::ui::credentials).map(|c| c.user).unwrap_or_default();
         let this = cx.weak_entity();
-        crate::conn_dialog::open(existing.clone(), folder, user, window, cx, move |c, user, password, window, cx| {
+        let root = crate::ui::project(&self.projects.borrow(), project).map(|p| p.root.clone()).unwrap_or_default();
+        crate::conn_dialog::open(existing.clone(), folder, user, self.engine.clone(), root, window, cx, move |c, user, password, window, cx| {
             let _ = this.update(cx, |wb, cx| wb.save_connection(project, existing.clone(), c, user, password, window, cx));
         });
     }
@@ -705,9 +706,11 @@ impl Workbench {
             Err(e) => return error(window, cx, format!("Could not save connection: {e}")),
         };
         // Keep the stored password when the field was left empty.
-        let password = password.or_else(|| crate::ui::credentials(&c).and_then(|x| x.password));
-        if let Err(e) = nbq_core::secrets::set(&c.secret_key(), &Credentials { user, password }) {
-            error(window, cx, format!("Could not store credentials: {e}"));
+        if !c.kind.is_file_based() {
+            let password = password.or_else(|| crate::ui::credentials(&c).and_then(|x| x.password));
+            if let Err(e) = nbq_core::secrets::set(&c.secret_key(), &Credentials { user, password }) {
+                error(window, cx, format!("Could not store credentials: {e}"));
+            }
         }
         match old {
             Some(old) => self.connection_changed(&old, window, cx),
@@ -740,7 +743,7 @@ impl Workbench {
         if let Err(e) = res {
             return error(window, cx, format!("Could not delete connection: {e}"));
         }
-        let _ = nbq_core::secrets::delete(&c.secret_key());
+        if !c.kind.is_file_based() { let _ = nbq_core::secrets::delete(&c.secret_key()); }
         self.engine.forget_connection(key);
         self.catalogs.borrow_mut().remove(key);
         self.sidebar.update(cx, |s, cx| s.refresh(cx));
@@ -1061,7 +1064,7 @@ impl Workbench {
                         .items_center()
                         .child(div().size(px(8.)).rounded_full().bg(color))
                         .child(div().text_color(theme.foreground).child(c.name.clone()))
-                        .child(format!("{}:{}/{}", c.host, c.port, c.database))
+                        .child(if c.kind.is_file_based() { c.file_path.display().to_string() } else { format!("{}:{}/{}", c.host, c.port, c.database) })
                         .child(div().text_color(state.1).child(state.0))
                         .into_any_element()
                 }

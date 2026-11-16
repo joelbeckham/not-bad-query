@@ -198,6 +198,7 @@ impl Project {
     fn stamp(&self, c: &mut Connection) {
         c.project_key = self.key;
         c.project_id = self.meta.id.clone();
+        c.project_root = self.root.clone();
     }
 
     fn conn_path(&self, folder: Option<&str>, name: &str) -> PathBuf {
@@ -336,6 +337,22 @@ mod tests {
         let mut c = Connection::new(name, DbKind::Postgres);
         c.folder = folder.map(str::to_string);
         c
+    }
+
+    #[test]
+    fn sqlite_connection_round_trip_resolves_relative_path_from_project() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/sqlite-project-tests");
+        std::fs::create_dir_all(&root).unwrap();
+        let dir = tempfile::tempdir_in(root).unwrap();
+        let mut project = Project::create(dir.path(), "SQLite").unwrap();
+        let mut c: Connection = toml::from_str("kind = 'sqlite'\nfile_path = 'data/local.db'\n").unwrap();
+        c.name = "Local".into();
+        c.id = uuid::Uuid::new_v4().to_string();
+        c = project.save_connection(c).unwrap();
+        let reopened = Project::open(dir.path()).unwrap();
+        let stored = reopened.connections.get(&c.id).unwrap();
+        assert_eq!(stored.file_path, PathBuf::from("data/local.db"));
+        assert_eq!(stored.params(None).file_path, project.root.join("data/local.db"));
     }
 
     #[test]

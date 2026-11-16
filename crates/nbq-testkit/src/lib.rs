@@ -44,6 +44,7 @@ pub fn pg() -> ConnectParams {
     UP.get_or_init(|| ensure_service("postgres"));
     ConnectParams {
         kind: DbKind::Postgres,
+        file_path: Default::default(),
         host: "127.0.0.1".into(),
         port: PG_PORT,
         database: "postgres".into(),
