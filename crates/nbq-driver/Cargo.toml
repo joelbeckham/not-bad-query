@@ -25,9 +25,11 @@ uuid.workspace = true
 serde.workspace = true
 tracing.workspace = true
 rusqlite = { version = "0.41", features = ["bundled", "column_decltype", "hooks", "limits"] }
+duckdb = { version = "1.20000.2", features = ["bundled"] }
+arrow-cast = "60.1"
+tempfile.workspace = true
 
 [dev-dependencies]
-tempfile.workspace = true
 nbq-testkit.workspace = true
 arrow-array.workspace = true
 tokio = { workspace = true, features = ["full"] }

@@ -106,6 +106,11 @@ pub fn classify(sql: &str, d: Dialect) -> StatementKind {
             .any(|k| eq(w, k))
     };
     match first.to_ascii_uppercase().as_str() {
+        // UNPIVOT's INTO names its output columns; it does not create a table.
+        "UNPIVOT" if d == Dialect::DuckDb => StatementKind::Query,
+        "FROM" | "PIVOT" | "SUMMARIZE" if d == Dialect::DuckDb => {
+            if rest().any(writes) { StatementKind::Write } else { StatementKind::Query }
+        }
         "SELECT" | "WITH" | "VALUES" | "TABLE" => {
             // Data-modifying CTEs and SELECT ... INTO write.
             if rest().any(writes) { StatementKind::Write } else { StatementKind::Query }
@@ -126,6 +131,14 @@ pub fn classify(sql: &str, d: Dialect) -> StatementKind {
 mod tests {
     use super::*;
     use StatementKind::*;
+
+    #[test]
+    fn duckdb_query_forms_can_pause() {
+        for sql in ["from range(1000)", "pivot sales on year using sum(amount)", "unpivot sales on jan, feb into name month value amount", "summarize select * from sales"] {
+            assert_eq!(classify(sql, Dialect::DuckDb), Query);
+        }
+        assert_eq!(classify("from t select * into other", Dialect::DuckDb), Write);
+    }
 
     fn k(s: &str) -> StatementKind {
         classify(s, Dialect::Postgres)

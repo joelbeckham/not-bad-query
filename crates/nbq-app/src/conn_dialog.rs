@@ -123,7 +123,8 @@ pub fn open(
                     .gap_2()
                     .child(seg("k-pg", "PostgreSQL", ch.kind == DbKind::Postgres, Rc::new(|c| c.kind = DbKind::Postgres)))
                     .child(seg("k-rs", "Redshift", ch.kind == DbKind::Redshift, Rc::new(|c| c.kind = DbKind::Redshift)))
-                    .child(seg("k-sqlite", "SQLite", ch.kind == DbKind::Sqlite, Rc::new(|c| c.kind = DbKind::Sqlite))).into_any_element(),
+                    .child(seg("k-sqlite", "SQLite", ch.kind == DbKind::Sqlite, Rc::new(|c| c.kind = DbKind::Sqlite)))
+                    .child(seg("k-duckdb", "DuckDB", ch.kind == DbKind::DuckDb, Rc::new(|c| c.kind = DbKind::DuckDb))).into_any_element(),
             ))
             .when(file_based, |body| body.child(
                 v_flex().gap_3()
@@ -141,7 +142,7 @@ pub fn open(
                                 window.spawn(cx, async move |cx| {
                                     let picker = rfd::AsyncFileDialog::new().set_directory(project_root)
                                         .add_filter("Database files", kind.file_extensions()).add_filter("All files", &["*"]);
-                                    let picked = if create { picker.set_file_name("database.db").save_file().await } else { picker.pick_file().await };
+                                    let picked = if create { picker.set_file_name(kind.default_file_name()).save_file().await } else { picker.pick_file().await };
                                     if let Some(file) = picked {
                                         let path = file.path().to_string_lossy().into_owned();
                                         let _ = cx.update(|window, cx| file_path.update(cx, |s, cx| s.set_value(path, window, cx)));
@@ -152,7 +153,7 @@ pub fn open(
                     .child(div().text_xs().text_color(theme.muted_foreground).child(if ch.create {
                         "Choose a new filename. The database is created when you save; existing files are never replaced."
                     } else {
-                        "Open a local SQLite database. Paths may be relative to this project."
+                        "Open a local database file. Paths may be relative to this project."
                     }))
             ))
             .when(!file_based, |body| body

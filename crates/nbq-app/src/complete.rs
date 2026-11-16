@@ -66,7 +66,7 @@ fn items_for_dialect(tables: &[CatalogTable], text: &str, offset: usize, dialect
                     continue;
                 }
                 // Unqualified: public tables by bare name, others as schema.table.
-                let label = if schema.is_some() || t.schema == "public" || (dialect == Dialect::Sqlite && t.schema == "main") {
+                let label = if schema.is_some() || t.schema == "public" || (matches!(dialect, Dialect::Sqlite | Dialect::DuckDb) && t.schema == "main") {
                     ident(&t.name)
                 } else {
                     format!("{}.{}", ident(&t.schema), ident(&t.name))
@@ -165,8 +165,10 @@ mod tests {
     fn sqlite_main_tables_complete_without_schema_prefix() {
         let tables = vec![CatalogTable { schema: "main".into(), name: "orders".into(), kind: ObjKind::Table, columns: vec![("id".into(), "INTEGER".into())] }];
         let sql = "select * from ord";
-        let (items, _) = items_for_dialect(&tables, sql, sql.len(), Dialect::Sqlite);
-        assert!(items.iter().any(|i| i.label == "orders"));
+        for dialect in [Dialect::Sqlite, Dialect::DuckDb] {
+            let (items, _) = items_for_dialect(&tables, sql, sql.len(), dialect);
+            assert!(items.iter().any(|i| i.label == "orders"));
+        }
     }
 
     fn cat() -> Vec<CatalogTable> {

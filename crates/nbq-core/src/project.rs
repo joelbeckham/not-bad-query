@@ -340,19 +340,21 @@ mod tests {
     }
 
     #[test]
-    fn sqlite_connection_round_trip_resolves_relative_path_from_project() {
+    fn file_connections_round_trip_resolve_relative_paths_from_project() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/sqlite-project-tests");
         std::fs::create_dir_all(&root).unwrap();
         let dir = tempfile::tempdir_in(root).unwrap();
         let mut project = Project::create(dir.path(), "SQLite").unwrap();
-        let mut c: Connection = toml::from_str("kind = 'sqlite'\nfile_path = 'data/local.db'\n").unwrap();
-        c.name = "Local".into();
-        c.id = uuid::Uuid::new_v4().to_string();
-        c = project.save_connection(c).unwrap();
-        let reopened = Project::open(dir.path()).unwrap();
-        let stored = reopened.connections.get(&c.id).unwrap();
-        assert_eq!(stored.file_path, PathBuf::from("data/local.db"));
-        assert_eq!(stored.params(None).file_path, project.root.join("data/local.db"));
+        for kind in [DbKind::Sqlite, DbKind::DuckDb] {
+            let mut c = Connection::new(format!("Local {kind:?}"), kind);
+            c.file_path = PathBuf::from("data/local.db");
+            c = project.save_connection(c).unwrap();
+            let reopened = Project::open(dir.path()).unwrap();
+            let stored = reopened.connections.get(&c.id).unwrap();
+            assert_eq!(stored.file_path, PathBuf::from("data/local.db"));
+            assert_eq!(stored.params(None).file_path, project.root.join("data/local.db"));
+            assert_eq!(stored.kind, kind);
+        }
     }
 
     #[test]

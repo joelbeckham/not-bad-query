@@ -25,10 +25,16 @@ struct H {
 
 impl H {
     async fn sqlite(autocommit: bool) -> H {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/sqlite-engine-tests");
+        Self::file(nbq_driver::DbKind::Sqlite, autocommit).await
+    }
+    async fn duckdb(autocommit: bool) -> H {
+        Self::file(nbq_driver::DbKind::DuckDb, autocommit).await
+    }
+    async fn file(kind: nbq_driver::DbKind, autocommit: bool) -> H {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/file-engine-tests");
         std::fs::create_dir_all(&root).unwrap();
         let dir = tempfile::tempdir_in(root).unwrap();
-        let params = ConnectParams::file(nbq_driver::DbKind::Sqlite, dir.path().join("local.db"));
+        let params = ConnectParams::file(kind, dir.path().join(kind.default_file_name()));
         nbq_driver::create_database(params.kind, &params.file_path).unwrap();
         let (engine, rx) = Engine::new(EngineOptions::new(dir.path().join("spool")));
         let tab = engine.open_tab();
@@ -145,6 +151,78 @@ impl H {
         p.application_name = "nbq-observer".into();
         nbq_driver::connect(&p).await.unwrap()
     }
+}
+
+#[tokio::test]
+async fn duckdb_pause_cancel_commit_export_and_reconnect() {
+    let mut h = H::duckdb(false).await;
+    h.ok("create table t(id integer primary key)").await;
+    h.commit().await;
+    h.ok("insert into t values (1) returning id").await;
+    let (q, events) = h.run("select * from range(1000000000)").await;
+    assert!(h.paused_at(q).await < 10_000);
+    let spool = spool_of(&events);
+    h.engine.cancel(h.tab);
+    h.ended(q).await;
+    assert!(!spool.read(0..1).unwrap().is_empty());
+    h.ok("insert into t values (2)").await;
+    h.commit().await;
+    let mut obs = h.observer().await;
+    assert_eq!(scalar(&mut *obs, "select count(*) from t").await, "2");
+    let (q, events) = h.run("select range as id from range(5000)").await;
+    let spool = spool_of(&events);
+    let path = h.dir.path().join("duckdb.csv");
+    h.engine.export_csv(h.tab, q, spool, path.clone(), CsvOptions::default());
+    h.wait(|e| matches!(e, Event::Export { done: Some(Ok(())), .. }).then_some(())).await;
+    let text = std::fs::read_to_string(path).unwrap();
+    assert_eq!(text.lines().count(), 5001);
+    assert_eq!(text.lines().last(), Some("4999"));
+    h.engine.set_connection(h.tab, None, true);
+    h.wait(|e| matches!(e, Event::Conn { state: ConnState::Disconnected, .. }).then_some(())).await;
+    h.engine.set_connection(h.tab, Some(h.params.clone()), true);
+    h.wait(|e| matches!(e, Event::Conn { state: ConnState::Connected, .. }).then_some(())).await;
+    h.ok("select * from t").await;
+}
+
+#[tokio::test]
+async fn duckdb_aborted_transaction_clears_pending_writes() {
+    let mut h = H::duckdb(false).await;
+    h.ok("create table t(id integer primary key)").await;
+    h.commit().await;
+    h.ok("insert into t values (1)").await;
+    let (_, events) = h.run("insert into t values (1)").await;
+    assert!(outcomes(&events).iter().any(|o| matches!(o, Outcome::Failed(_))));
+    assert!(!h.txn.unwrap().in_txn);
+    assert_eq!(h.txn.unwrap().pending_writes, 0);
+    h.ok("insert into t values (2)").await;
+    h.commit().await;
+    let mut obs = h.observer().await;
+    assert_eq!(scalar(&mut *obs, "select sum(id) from t").await, "2");
+}
+
+#[tokio::test]
+async fn duckdb_metadata_lists_schemas_tables_views_keys_indexes_sequences_and_macros() {
+    use nbq_engine::meta::{self, ObjKind, ObjPath};
+    let mut h = H::duckdb(true).await;
+    let mut s = h.observer().await;
+    for sql in ["create schema \"odd ' schema\"", "create table \"odd ' schema\".t(id integer primary key, value decimal(10,2))", "create index idx_value on \"odd ' schema\".t(value)", "create view main.v as select id from \"odd ' schema\".t", "create sequence main.seq", "create macro main.twice(x) as x * 2"] { s.execute(sql).await.unwrap(); }
+    h.engine.load_objects("duckdb-test", &h.params, ObjPath::Root);
+    let roots = h.wait(|e| match e { Event::Objects { path: ObjPath::Root, items, .. } => Some(items.clone().unwrap()), _ => None }).await;
+    assert!(roots.iter().any(|i| i.name == "main"));
+    assert!(roots.iter().any(|i| i.name == "odd ' schema"));
+    let folders = meta::list(&mut *s, &ObjPath::Schema("main".into())).await.unwrap();
+    assert_eq!(folders.len(), 4);
+    for (kind, expected) in [(ObjKind::View, "v"), (ObjKind::Sequence, "seq"), (ObjKind::Function, "twice")] {
+        let items = meta::list(&mut *s, &ObjPath::Folder { schema: "main".into(), kind }).await.unwrap();
+        assert!(items.iter().any(|i| i.name == expected));
+    }
+    let tables = meta::list(&mut *s, &ObjPath::Folder { schema: "odd ' schema".into(), kind: ObjKind::Table }).await.unwrap();
+    let children = meta::list(&mut *s, tables[0].path.as_ref().unwrap()).await.unwrap();
+    assert!(children.iter().any(|i| i.name == "id" && i.key));
+    assert!(children.iter().any(|i| i.name == "idx_value" && i.kind == ObjKind::Index));
+    let catalog = meta::catalog(&mut *s).await.unwrap();
+    assert_eq!(catalog.len(), 2);
+    assert_eq!(catalog.iter().find(|t| t.name == "t").unwrap().columns.len(), 2);
 }
 
 #[tokio::test]

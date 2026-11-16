@@ -144,15 +144,16 @@ its implicit statement transaction until completion or cancellation.
 ## File-backed databases
 
 SQLite profiles use `kind = "sqlite"` and `file_path = "data/local.db"`.
+DuckDB profiles use `kind = "duckdb"` and `file_path = "data/local.duckdb"`.
 Relative paths resolve against the owning project's root, independently of the
 connection file's folder or the app's working directory. The shared file-database
 dialog offers **Open existing** and **Create new**, with native file pickers.
 Creation happens explicitly on Save and atomically reserves a new filename;
-opening and reconnecting never create missing files. SQLite does not use the
+opening and reconnecting never create missing files. File-based engines do not use the
 credential store or server/TLS fields.
 
 `DbKind::is_file_based`, `file_extensions`, `ConnectParams::file`, and the engine's
-`prepare_database_file` keep the file workflow reusable for a future DuckDB driver.
+`prepare_database_file` share the file workflow between SQLite and DuckDB.
 Each SQLite session owns a dedicated blocking worker, including its connection
 and prepared statements. Arrow batches are requested on demand, bounded by the
 same value/row/batch limits as server drivers. SQLite's dynamic storage classes
@@ -162,6 +163,22 @@ use SQLite's schema and pragma interfaces for tables, views, columns, indexes,
 triggers, and autocomplete. Interrupt handles support cancellation; savepoints
 preserve manual transactions after ordinary errors, and the engine reconciles
 transaction state if SQLite rolls back the entire transaction after an error.
+
+DuckDB also uses one blocking worker per session, with native Arrow streaming.
+A process-wide weak cache shares each canonical file's database instance across
+independent connections for tabs and metadata; the instance closes after its last
+session closes. DuckDB's working-memory limit is 512 MiB per database instance,
+with its normal disk spill behavior. Result batches honor fetch row limits and
+the driver byte limits, and additional Arrow types (unsigned integers, decimals,
+dates, lists and structs) have display formatters. Database creation initializes
+a file in a same-directory staging folder and publishes it without overwriting
+an existing destination. The browser lists schemas, tables, views, columns,
+primary keys, indexes, sequences and user macros.
+
+DuckDB has no savepoints. A paused result can be stopped without draining it or
+discarding pending writes. Running queries use DuckDB's interrupt handle. An
+execution error that aborts a manual transaction triggers rollback and clears the
+tab's transaction state; errors that leave the transaction usable preserve it.
 
 ## TLS and scripts
 
@@ -218,7 +235,7 @@ exports/                           CSV export default (git-ignored)
 | Layer | How |
 |---|---|
 | `nbq-sql` | table tests + proptests (never panics, ranges valid) |
-| `nbq-driver` | real Postgres: type rendering oracle, pause (`ClientWrite`), cancel, errors |
+| `nbq-driver` | real Postgres: type rendering oracle, pause (`ClientWrite`), cancel, errors; SQLite/DuckDB: file creation, values, cancel, transaction isolation and rollback |
 | `nbq-results` | windows across batch boundaries, live export, CSV quoting, bounded memory |
 | `nbq-engine` | headless E2E: scroll/fetch, export, cancel, txn commit/rollback, savepoint recovery, reconnect |
 | `nbq-app` | Helper/completion unit tests; native screenshots reviewed by Claude via `AGENTS.md` |

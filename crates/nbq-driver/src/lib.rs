@@ -23,6 +23,7 @@ pub const TARGET_BATCH_BYTES: usize = 4 * 1024 * 1024;
 pub mod display;
 pub mod pg;
 pub mod sqlite;
+pub mod duckdb;
 
 pub use nbq_sql::Dialect;
 
@@ -80,6 +81,7 @@ pub enum DbKind {
     Postgres,
     Redshift,
     Sqlite,
+    DuckDb,
 }
 
 impl DbKind {
@@ -88,14 +90,19 @@ impl DbKind {
             DbKind::Postgres => Dialect::Postgres,
             DbKind::Redshift => Dialect::Redshift,
             DbKind::Sqlite => Dialect::Sqlite,
+            DbKind::DuckDb => Dialect::DuckDb,
         }
     }
 
     /// File-backed engines share the connection dialog and path configuration.
-    pub fn is_file_based(self) -> bool { matches!(self, Self::Sqlite) }
+    pub fn is_file_based(self) -> bool { matches!(self, Self::Sqlite | Self::DuckDb) }
 
     pub fn file_extensions(self) -> &'static [&'static str] {
-        match self { Self::Sqlite => &["db", "sqlite", "sqlite3"], _ => &[] }
+        match self { Self::Sqlite => &["db", "sqlite", "sqlite3"], Self::DuckDb => &["duckdb", "ddb", "db"], _ => &[] }
+    }
+
+    pub fn default_file_name(self) -> &'static str {
+        match self { Self::DuckDb => "database.duckdb", _ => "database.db" }
     }
 }
 
@@ -209,6 +216,8 @@ pub struct Capabilities {
 pub trait Session: Send {
     fn dialect(&self) -> Dialect;
     fn capabilities(&self) -> Capabilities;
+    /// Drivers without savepoints may still safely stop a paused stream.
+    fn can_cancel_in_transaction(&self) -> bool { self.capabilities().savepoints }
     fn cancel_handle(&self) -> Arc<dyn CancelHandle>;
     /// Execute exactly one statement. While a returned [`RowStream`] is alive
     /// the session must not be used for anything else; the engine enforces
@@ -229,6 +238,7 @@ pub async fn connect(params: &ConnectParams) -> Result<Box<dyn Session>> {
     match params.kind {
         DbKind::Postgres | DbKind::Redshift => Ok(Box::new(pg::PgSession::connect(params).await?)),
         DbKind::Sqlite => Ok(Box::new(sqlite::SqliteSession::connect(params).await?)),
+        DbKind::DuckDb => Ok(Box::new(duckdb::DuckDbSession::connect(params).await?)),
     }
 }
 
@@ -236,6 +246,7 @@ pub async fn connect(params: &ConnectParams) -> Result<Box<dyn Session>> {
 pub fn create_database(kind: DbKind, path: &std::path::Path) -> Result<()> {
     match kind {
         DbKind::Sqlite => sqlite::create_database(path),
+        DbKind::DuckDb => duckdb::create_database(path),
         _ => Err(DriverError::connection("This engine does not use a database file")),
     }
 }

@@ -532,7 +532,7 @@ impl TabActor {
                         query,
                         demand: Arc::new(demand_tx),
                         discard: Arc::new(AtomicBool::new(false)),
-                        policy: if self.txn.in_txn && !use_sp { StopPolicy::Drain } else { StopPolicy::Cancel },
+                        policy: if self.txn.in_txn && !self.session.as_ref().unwrap().can_cancel_in_transaction() { StopPolicy::Drain } else { StopPolicy::Cancel },
                         spool,
                     };
                     self.shared.set_fetch(Some(ctl.clone()));

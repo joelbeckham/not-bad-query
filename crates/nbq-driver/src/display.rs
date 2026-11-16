@@ -31,7 +31,11 @@ pub fn cell_text(array: &ArrayRef, row: usize, out: &mut String) -> bool {
         DataType::LargeUtf8 => out.push_str(array.as_string::<i64>().value(row)),
         DataType::Binary => push_hex(array.as_binary::<i32>().value(row), out),
         other => {
-            let _ = write!(out, "<{other}>");
+            if let Ok(formatter) = arrow_cast::display::ArrayFormatter::try_new(array.as_ref(), &Default::default()) {
+                let _ = write!(out, "{}", formatter.value(row));
+            } else {
+                let _ = write!(out, "<{other}>");
+            }
         }
     }
     true

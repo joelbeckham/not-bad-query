@@ -103,12 +103,12 @@ impl Connection {
             port: match kind {
                 DbKind::Postgres => 5432,
                 DbKind::Redshift => 5439,
-                DbKind::Sqlite => 0,
+                DbKind::Sqlite | DbKind::DuckDb => 0,
             },
             database: match kind {
                 DbKind::Postgres => "postgres".into(),
                 DbKind::Redshift => "dev".into(),
-                DbKind::Sqlite => String::new(),
+                DbKind::Sqlite | DbKind::DuckDb => String::new(),
             },
             ssl: SslMode::VerifyFull,
             ssl_root_cert: String::new(),
