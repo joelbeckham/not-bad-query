@@ -1,8 +1,0 @@
-id = "7441da75-0a40-4f91-b8b5-0ac0d774aec4"
-kind = "postgres"
-host = "dev-shard-frodo.cluster-cnwblbhzreyb.us-east-1.rds.amazonaws.com"
-port = 5432
-database = "frodo"
-ssl = "prefer"
-color = "green"
-autocommit = true
