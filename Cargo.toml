@@ -41,6 +41,7 @@ proptest = "1.12"
 
 [profile.dev]
 opt-level = 1
+debug = 1
 
 [profile.dev.package."*"]
 opt-level = 3
