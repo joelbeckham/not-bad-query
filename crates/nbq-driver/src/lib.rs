@@ -24,6 +24,7 @@ pub mod display;
 pub mod pg;
 pub mod sqlite;
 pub mod duckdb;
+mod mysql;
 pub mod csv_import;
 
 pub use nbq_sql::Dialect;
@@ -81,15 +82,34 @@ impl ColumnKind {
 pub enum DbKind {
     Postgres,
     Redshift,
+    MySql,
     Sqlite,
     DuckDb,
 }
 
 impl DbKind {
+    pub fn default_port(self) -> u16 {
+        match self {
+            Self::Postgres => 5432,
+            Self::Redshift => 5439,
+            Self::MySql => 3306,
+            Self::Sqlite | Self::DuckDb => 0,
+        }
+    }
+
+    pub fn default_database(self) -> &'static str {
+        match self {
+            Self::Postgres => "postgres",
+            Self::Redshift => "dev",
+            _ => "",
+        }
+    }
+
     pub fn dialect(self) -> Dialect {
         match self {
             DbKind::Postgres => Dialect::Postgres,
             DbKind::Redshift => Dialect::Redshift,
+            DbKind::MySql => Dialect::MySql,
             DbKind::Sqlite => Dialect::Sqlite,
             DbKind::DuckDb => Dialect::DuckDb,
         }
@@ -238,6 +258,7 @@ pub trait Session: Send {
 pub async fn connect(params: &ConnectParams) -> Result<Box<dyn Session>> {
     match params.kind {
         DbKind::Postgres | DbKind::Redshift => Ok(Box::new(pg::PgSession::connect(params).await?)),
+        DbKind::MySql => Ok(Box::new(mysql::MySqlSession::connect(params).await?)),
         DbKind::Sqlite => Ok(Box::new(sqlite::SqliteSession::connect(params).await?)),
         DbKind::DuckDb => Ok(Box::new(duckdb::DuckDbSession::connect(params).await?)),
     }

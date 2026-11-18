@@ -26,7 +26,10 @@ pub struct SqlCompleter {
 const MAX_ITEMS: usize = 200;
 
 /// Quote an identifier if it isn't a plain lowercase name.
-fn ident(s: &str) -> String {
+fn ident(s: &str, dialect: Dialect) -> String {
+    if dialect == Dialect::MySql {
+        return format!("`{}`", s.replace('`', "``"));
+    }
     let plain = s.chars().next().is_some_and(|c| c.is_ascii_lowercase() || c == '_')
         && s.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
     if plain { s.to_string() } else { format!("\"{}\"", s.replace('"', "\"\"")) }
@@ -57,6 +60,7 @@ fn items_for_dialect(tables: &[CatalogTable], text: &str, offset: usize, dialect
         return (Vec::new(), offset..offset);
     };
     let eq = |a: &str, b: &str| a.eq_ignore_ascii_case(b);
+    let ident = |name: &str| ident(name, dialect);
     let mut scored: Vec<(u8, CompletionItem)> = Vec::new();
     match &ctx.want {
         Want::Tables { schema } => {
@@ -66,7 +70,7 @@ fn items_for_dialect(tables: &[CatalogTable], text: &str, offset: usize, dialect
                     continue;
                 }
                 // Unqualified: public tables by bare name, others as schema.table.
-                let label = if schema.is_some() || t.schema == "public" || (matches!(dialect, Dialect::Sqlite | Dialect::DuckDb) && t.schema == "main") {
+                let label = if schema.is_some() || (dialect != Dialect::MySql && t.schema == "public") || (matches!(dialect, Dialect::Sqlite | Dialect::DuckDb) && t.schema == "main") {
                     ident(&t.name)
                 } else {
                     format!("{}.{}", ident(&t.schema), ident(&t.name))

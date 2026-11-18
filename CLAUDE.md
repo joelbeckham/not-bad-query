@@ -8,12 +8,12 @@ See `docs/ARCHITECTURE.md` for the design.
 | Crate | Role |
 |---|---|
 | `nbq-sql` | Pure text utils: statement splitting, statement-at-cursor, statement classification. No IO. |
-| `nbq-driver` | `Session`/`RowStream`/`CancelHandle` traits; Postgres/Redshift (`pg/`), SQLite and DuckDB drivers; Arrow cell display. |
+| `nbq-driver` | `Session`/`RowStream`/`CancelHandle` traits, database drivers for PostgreSQL, Redshift, MySQL, SQLite, and DuckDB, and Arrow cell display. |
 | `nbq-results` | Disk spool of Arrow batches (bounded memory), windowed reads, CSV export. |
 | `nbq-engine` | Headless app core: per-tab session actors, fetch-on-demand, transactions, cancel. Commands in, `Event`s out. |
 | `nbq-core` | Projects (folder of connection files + scripts, file watcher), app settings/workspace TOML, OS keyring credentials. |
 | `nbq-app` | GPUI UI only (`not-bad-query` binary). Never touches the DB or files directly; goes through `nbq-engine`. |
-| `nbq-testkit` | Test fixtures (dev Postgres). |
+| `nbq-testkit` | Test fixtures (dev PostgreSQL and MySQL). |
 
 ## Commands
 

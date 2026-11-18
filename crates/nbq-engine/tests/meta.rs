@@ -88,6 +88,42 @@ async fn catalog_lists_relations_with_columns() {
     assert_eq!(v.kind, ObjKind::View);
 }
 
+#[tokio::test]
+async fn mysql_object_browser_and_catalog_handle_quoted_names() {
+    let p = tokio::task::spawn_blocking(nbq_testkit::mysql).await.unwrap();
+    let mut session = nbq_driver::connect(&p).await.unwrap();
+    for sql in [
+        "DROP VIEW IF EXISTS mysql_meta_view",
+        "DROP TABLE IF EXISTS `mysql 'meta`",
+        "CREATE TABLE `mysql 'meta` (id BIGINT UNSIGNED PRIMARY KEY, label VARCHAR(32), UNIQUE INDEX by_label (label))",
+        "CREATE VIEW mysql_meta_view AS SELECT id FROM `mysql 'meta`",
+    ] {
+        session.execute(sql).await.unwrap();
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (engine, mut rx) = Engine::new(EngineOptions::new(dir.path().into()));
+    let schemas = objects(&engine, &mut rx, &p, ObjPath::Root).await;
+    assert!(schemas.iter().any(|schema| schema.name == "nbq"));
+    assert!(!schemas.iter().any(|schema| schema.name == "information_schema"));
+    let categories = objects(&engine, &mut rx, &p, ObjPath::Schema("nbq".into())).await;
+    let tables = objects(&engine, &mut rx, &p, categories[0].path.clone().unwrap()).await;
+    let table = tables.iter().find(|table| table.name == "mysql 'meta").unwrap();
+    let children = objects(&engine, &mut rx, &p, table.path.clone().unwrap()).await;
+    assert!(children.iter().any(|column| column.kind == ObjKind::Column && column.name == "id" && column.key));
+    assert!(children.iter().any(|index| index.kind == ObjKind::Index && index.name == "by_label" && index.key));
+
+    engine.load_catalog("c1", &p);
+    let catalog = loop {
+        if let Event::Catalog { tables, .. } = tokio::time::timeout(Duration::from_secs(10), rx.recv()).await.unwrap().unwrap() {
+            break tables.unwrap();
+        }
+    };
+    assert!(catalog.iter().any(|table| table.name == "mysql 'meta" && table.columns.contains(&("label".into(), "varchar(32)".into()))));
+    assert!(catalog.iter().any(|table| table.name == "mysql_meta_view" && table.kind == ObjKind::View));
+    session.execute("DROP VIEW mysql_meta_view").await.unwrap();
+    session.execute("DROP TABLE `mysql 'meta`").await.unwrap();
+}
+
 async fn metadata_state(rx: &mut tokio::sync::mpsc::UnboundedReceiver<Event>) -> ConnState {
     loop {
         if let Event::MetadataConn { conn, state } = tokio::time::timeout(Duration::from_secs(10), rx.recv()).await.unwrap().unwrap() {

@@ -376,9 +376,16 @@ impl TabActor {
         }
     }
 
-    fn on_error(&mut self, e: &DriverError) {
-        if self.txn.in_txn && self.session.as_ref().is_some_and(|s| s.transaction_active() == Some(false)) {
+    fn reconcile_transaction_end(&mut self) -> bool {
+        let ended = self.txn.in_txn && self.session.as_ref().is_some_and(|s| s.transaction_active() == Some(false));
+        if ended {
             self.reset_txn();
+        }
+        ended
+    }
+
+    fn on_error(&mut self, e: &DriverError) {
+        if self.reconcile_transaction_end() {
             self.emit_txn();
         }
         if e.kind == ErrorKind::Connection || self.session.as_ref().is_some_and(|s| s.is_closed()) {
@@ -406,6 +413,8 @@ impl TabActor {
     async fn settle(&mut self, savepoint: bool, write: bool, end: &FetchEnd) {
         if let Some(e) = &end.error {
             self.on_error(e);
+        } else if self.reconcile_transaction_end() {
+            self.emit_txn();
         }
         if self.session.is_none() {
             return;
@@ -496,7 +505,12 @@ impl TabActor {
                             self.txn.since = Some(Instant::now());
                         }
                         StatementKind::Commit | StatementKind::Rollback => self.reset_txn(),
-                        StatementKind::Write if self.txn.in_txn => self.txn.pending_writes += 1,
+                        StatementKind::Write => {
+                            self.reconcile_transaction_end();
+                            if self.txn.in_txn {
+                                self.txn.pending_writes += 1;
+                            }
+                        }
                         _ => {}
                     }
                     if kind != StatementKind::Query {

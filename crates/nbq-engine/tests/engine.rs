@@ -50,6 +50,10 @@ impl H {
     async fn with_timeout(app: &str, autocommit: bool, timeout: Duration) -> H {
         let mut params = tokio::task::spawn_blocking(nbq_testkit::pg).await.unwrap();
         params.application_name = app.into();
+        Self::with_server(params, autocommit, timeout).await
+    }
+
+    async fn with_server(params: ConnectParams, autocommit: bool, timeout: Duration) -> H {
         let dir = tempfile::tempdir().unwrap();
         let mut opts = EngineOptions::new(dir.path().join("spool"));
         opts.transaction_idle_timeout = timeout;
@@ -151,6 +155,27 @@ impl H {
         p.application_name = "nbq-observer".into();
         nbq_driver::connect(&p).await.unwrap()
     }
+}
+
+#[tokio::test]
+async fn mysql_pauses_results_and_reconciles_implicit_commit() {
+    let params = tokio::task::spawn_blocking(nbq_testkit::mysql).await.unwrap();
+    let mut h = H::with_server(params, false, Duration::from_secs(900)).await;
+    h.ok("CREATE TEMPORARY TABLE mysql_engine_pending (id INT PRIMARY KEY)").await;
+    h.ok("INSERT INTO mysql_engine_pending VALUES (1)").await;
+    let (query, _) = h.run(
+        "WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 1000) \
+         SELECT n, REPEAT('x', 32768) FROM seq"
+    ).await;
+    let paused_rows = h.paused_at(query).await;
+    assert!((500..756).contains(&paused_rows), "paused at {paused_rows} rows");
+    h.engine.cancel(h.tab);
+    h.ended(query).await;
+    assert!(h.txn.is_some_and(|txn| txn.in_txn && txn.pending_writes == 2));
+
+    h.ok("CREATE TABLE IF NOT EXISTS mysql_engine_ddl (id int)").await;
+    assert!(h.txn.is_some_and(|txn| !txn.in_txn && txn.pending_writes == 0));
+    h.ok("DROP TABLE mysql_engine_ddl").await;
 }
 
 #[tokio::test]

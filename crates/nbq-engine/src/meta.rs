@@ -14,6 +14,7 @@ use tokio::sync::{Mutex as AsyncMutex, mpsc, watch};
 use crate::{ConnState, Event};
 mod sqlite;
 mod duckdb;
+mod mysql;
 
 /// Where in the object tree to list children.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -133,6 +134,7 @@ fn col(r: &[Option<String>], i: usize) -> String {
 pub async fn list(s: &mut dyn Session, path: &ObjPath) -> Result<Vec<ObjItem>, DriverError> {
     if s.dialect() == nbq_driver::Dialect::Sqlite { return sqlite::list(s, path).await; }
     if s.dialect() == nbq_driver::Dialect::DuckDb { return duckdb::list(s, path).await; }
+    if s.dialect() == nbq_driver::Dialect::MySql { return mysql::list(s, path).await; }
     let item = |name: String, kind, detail: Option<String>, has_children, path| ObjItem {
         name,
         kind,
@@ -318,6 +320,7 @@ fn approx_rows(n: u64) -> String {
 pub async fn catalog(s: &mut dyn Session) -> Result<Vec<CatalogTable>, DriverError> {
     if s.dialect() == nbq_driver::Dialect::Sqlite { return sqlite::catalog(s).await; }
     if s.dialect() == nbq_driver::Dialect::DuckDb { return duckdb::catalog(s).await; }
+    if s.dialect() == nbq_driver::Dialect::MySql { return mysql::catalog(s).await; }
     let rows = strings(
         s,
         "select n.nspname, c.relname, c.relkind::text, a.attname, format_type(a.atttypid, a.atttypmod) \

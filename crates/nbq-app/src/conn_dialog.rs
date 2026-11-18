@@ -17,6 +17,7 @@ use nbq_driver::{DbKind, SslMode};
 
 struct Choices {
     kind: DbKind,
+    server_kind: DbKind,
     ssl: SslMode,
     color: Option<String>,
     autocommit: bool,
@@ -47,19 +48,21 @@ pub fn open(
         cx.new(|cx| InputState::new(window, cx).placeholder(ph).default_value(v))
     };
     let name = input(base.name.clone(), "Connection name", window, cx);
-    let folder = input(base.folder.clone().unwrap_or_default(), "Prod/US (optional)", window, cx);
+    let folder = input(base.folder.clone().unwrap_or_default(), "Prod/US", window, cx);
     let host = input(base.host.clone(), "localhost", window, cx);
-    let port = input(base.port.to_string(), "5432", window, cx);
-    let database = input(base.database.clone(), "postgres", window, cx);
+    let server_kind = if base.kind.is_file_based() { DbKind::Postgres } else { base.kind };
+    let port = input(if base.port == 0 { server_kind.default_port() } else { base.port }.to_string(), "", window, cx);
+    let database = input(base.database.clone(), "Database name", window, cx);
     let file_path = input(base.file_path.to_string_lossy().into_owned(), "Choose a database file…", window, cx);
-    let user = input(if editing { user } else { "postgres".into() }, "postgres", window, cx);
+    let user = input(if editing { user } else { "postgres".into() }, "Username", window, cx);
     let password = cx.new(|cx| {
         InputState::new(window, cx)
             .masked(true)
-            .placeholder(if editing { "unchanged" } else { "password" })
+            .placeholder(if editing { "Unchanged" } else { "Password" })
     });
     let choices = Rc::new(RefCell::new(Choices {
         kind: base.kind,
+        server_kind,
         ssl: base.ssl,
         color: base.color.clone(),
         autocommit: base.autocommit,
@@ -86,12 +89,45 @@ pub fn open(
         };
         let seg = |id: &'static str, label: &'static str, on: bool, f: Rc<dyn Fn(&mut Choices)>| {
             let choices = choices.clone();
-            Button::new(id).xsmall().label(label).when(on, |b| b.primary()).when(!on, |b| b.ghost()).on_click(
+            Button::new(id).xsmall().px_2().label(label).when(on, |b| b.primary()).when(!on, |b| b.ghost()).on_click(
                 move |_, window, _| {
                     f(&mut choices.borrow_mut());
                     window.refresh();
                 },
             )
+        };
+        let engine_button = |id: &'static str, label: &'static str, kind: DbKind| {
+            let (choices, port, database, user) = (choices.clone(), port.clone(), database.clone(), user.clone());
+            Button::new(id).xsmall().px_2().label(label)
+                .when(ch.kind == kind, |button| button.primary())
+                .when(ch.kind != kind, |button| button.ghost())
+                .on_click(move |_, window, cx| {
+                    let previous = choices.borrow().server_kind;
+                    if !kind.is_file_based() && previous != kind {
+                        port.update(cx, |input, cx| {
+                            if input.value().trim() == previous.default_port().to_string() {
+                                input.set_value(kind.default_port().to_string(), window, cx);
+                            }
+                        });
+                        database.update(cx, |input, cx| {
+                            if input.value().trim() == previous.default_database() {
+                                input.set_value(kind.default_database(), window, cx);
+                            }
+                        });
+                        if !editing {
+                            user.update(cx, |input, cx| {
+                                let old_default = if previous == DbKind::MySql { "" } else { "postgres" };
+                                if input.value().trim() == old_default {
+                                    let new_default = if kind == DbKind::MySql { "" } else { "postgres" };
+                                    input.set_value(new_default, window, cx);
+                                }
+                            });
+                        }
+                        choices.borrow_mut().server_kind = kind;
+                    }
+                    choices.borrow_mut().kind = kind;
+                    window.refresh();
+                })
         };
         let swatches = h_flex().gap_1p5().children(
             std::iter::once((None, 0x000000u32)).chain(PALETTE.iter().map(|(n, c)| (Some(*n), *c))).map(|(n, rgbv)| {
@@ -115,16 +151,23 @@ pub fn open(
         let body = v_flex()
             .gap_3()
             .child(h_flex().gap_3().child(field("Name", Input::new(&name).into_any_element())).child(field(
-                "Folder",
+                "Folder (optional)",
                 Input::new(&folder).into_any_element(),
             )))
             .child(field("Connection type",
                 h_flex()
-                    .gap_2()
-                    .child(seg("k-pg", "PostgreSQL", ch.kind == DbKind::Postgres, Rc::new(|c| c.kind = DbKind::Postgres)))
-                    .child(seg("k-rs", "Redshift", ch.kind == DbKind::Redshift, Rc::new(|c| c.kind = DbKind::Redshift)))
-                    .child(seg("k-sqlite", "SQLite", ch.kind == DbKind::Sqlite, Rc::new(|c| c.kind = DbKind::Sqlite)))
-                    .child(seg("k-duckdb", "DuckDB", ch.kind == DbKind::DuckDb, Rc::new(|c| c.kind = DbKind::DuckDb))).into_any_element(),
+                    .gap_1()
+                    .self_start()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(theme.border)
+                    .p_1()
+                    .child(engine_button("k-pg", "PostgreSQL", DbKind::Postgres))
+                    .child(engine_button("k-rs", "Redshift", DbKind::Redshift))
+                    .child(engine_button("k-mysql", "MySQL", DbKind::MySql))
+                    .child(div().mx_1().w(px(1.)).h_4().bg(theme.border))
+                    .child(engine_button("k-sqlite", "SQLite", DbKind::Sqlite))
+                    .child(engine_button("k-duckdb", "DuckDB", DbKind::DuckDb)).into_any_element(),
             ))
             .when(file_based, |body| body.child(
                 v_flex().gap_3()
@@ -166,19 +209,22 @@ pub fn open(
             .child(
                 h_flex()
                     .gap_3()
-                    .child(field("Database", Input::new(&database).into_any_element()))
+                    .child(field(if ch.kind == DbKind::MySql { "Database (optional)" } else { "Database" }, Input::new(&database).into_any_element()))
                     .child(field("User", Input::new(&user).into_any_element()))
                     .child(field("Password", Input::new(&password).into_any_element())),
             )
             .child(
                 h_flex()
+                    .mt_1()
                     .gap_2()
                     .items_center()
                     .child(div().text_xs().text_color(theme.muted_foreground).w(px(40.)).child("SSL"))
-                    .child(seg("ssl-off", "Disable", ch.ssl == SslMode::Disable, Rc::new(|c| c.ssl = SslMode::Disable)))
-                    .child(seg("ssl-pref", "Prefer", ch.ssl == SslMode::Prefer, Rc::new(|c| c.ssl = SslMode::Prefer)))
-                    .child(seg("ssl-req", "Require", ch.ssl == SslMode::Require, Rc::new(|c| c.ssl = SslMode::Require)))
-                    .child(seg("ssl-verify", "Verify full", ch.ssl == SslMode::VerifyFull, Rc::new(|c| c.ssl = SslMode::VerifyFull))),
+                    .child(h_flex().gap_1().rounded_md().border_1().border_color(theme.border).p_1()
+                        .child(seg("ssl-off", "Disable", ch.ssl == SslMode::Disable, Rc::new(|c| c.ssl = SslMode::Disable)))
+                        .child(seg("ssl-pref", "Prefer", ch.ssl == SslMode::Prefer, Rc::new(|c| c.ssl = SslMode::Prefer)))
+                        .child(seg("ssl-req", "Require", ch.ssl == SslMode::Require, Rc::new(|c| c.ssl = SslMode::Require)))
+                        .child(seg("ssl-verify", "Verify full", ch.ssl == SslMode::VerifyFull, Rc::new(|c| c.ssl = SslMode::VerifyFull))
+                            .tooltip("Verifies the certificate chain and server hostname"))),
             )
             .when(ch.ssl == SslMode::Prefer || ch.ssl == SslMode::Require, |body| body.child(
                 div().text_xs().text_color(theme.warning).child("Server identity is not verified. Use Verify full to validate its certificate.")
@@ -206,7 +252,7 @@ pub fn open(
                             }).detach();
                         })
                     })
-                    .child(div().text_xs().child(if ch.ca.is_empty() { "System / AWS roots" } else { "Custom CA loaded" }))
+                    .child(div().text_xs().text_color(theme.muted_foreground).child(if !ch.ca.is_empty() { "Custom CA loaded" } else if ch.kind == DbKind::MySql { "Using system and public roots" } else { "Using system and AWS roots" }))
                     .when(!ch.ca.is_empty(), |row| {
                         let choices = choices.clone();
                         row.child(Button::new("clear-ca").xsmall().ghost().label("Clear").on_click(move |_, window, _| {

@@ -15,3 +15,17 @@ services:
       interval: 1s
       timeout: 3s
       retries: 120
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_ROOT_PASSWORD: nbq-dev-root
+      MYSQL_DATABASE: nbq
+      MYSQL_USER: nbq
+      MYSQL_PASSWORD: nbq
+    ports:
+      - "127.0.0.1:33306:3306"
+    healthcheck:
+      test: ["CMD-SHELL", "MYSQL_PWD=$$MYSQL_PASSWORD mysql --host=127.0.0.1 --user=$$MYSQL_USER $$MYSQL_DATABASE --execute='SELECT 1'"]
+      interval: 1s
+      timeout: 3s
+      retries: 120

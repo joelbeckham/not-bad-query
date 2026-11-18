@@ -144,6 +144,25 @@ its implicit statement transaction until completion or cancellation.
   session drop. PostgreSQL itself rolls back any open transaction when a session
   terminates ([protocol documentation](https://www.postgresql.org/docs/current/protocol-flow.html)).
 
+## MySQL
+
+Use a **MySQL** connection profile (`kind = "mysql"`, default port 3306).
+The initial database is optional. Credentials use the same OS credential store
+as the other server drivers. **Verify full** checks the certificate chain and
+server name against system and public roots, with optional imported PEM roots.
+
+The driver uses the MySQL text protocol to preserve exact numeric values,
+including unsigned integers and decimals, and streams bounded Arrow batches
+on demand. It displays the first result set of a statement and consumes any
+additional sets before the session is reused. **Stop** uses `KILL QUERY` on a
+separate connection authenticated as the same user. MySQL's implicit commits,
+such as for ordinary DDL, update the tab's transaction state. The object tree
+and autocomplete use a separate metadata connection to browse databases,
+tables, views, columns, indexes, and triggers.
+
+Integration tests use MySQL 8.4 via `dev/docker-compose.yml` on loopback port
+33306. Start the `mysql` Compose service to use it in the app.
+
 ## File-backed databases
 
 SQLite profiles use `kind = "sqlite"` and `file_path = "data/local.db"`.

@@ -13,6 +13,7 @@ use std::time::Duration;
 use nbq_driver::{ConnectParams, DbKind, SslMode};
 
 pub const PG_PORT: u16 = 55432;
+pub const MYSQL_PORT: u16 = 33306;
 
 fn compose_file() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../dev/docker-compose.yml")
@@ -50,6 +51,25 @@ pub fn pg() -> ConnectParams {
         database: "postgres".into(),
         user: "postgres".into(),
         password: Some("postgres".into()),
+        ssl: SslMode::Disable,
+        ssl_root_cert: String::new(),
+        connect_timeout: Duration::from_secs(10),
+        application_name: "nbq-test".into(),
+    }
+}
+
+/// Connection params for dev MySQL 8.4 using a regular database user.
+pub fn mysql() -> ConnectParams {
+    static UP: OnceLock<()> = OnceLock::new();
+    UP.get_or_init(|| ensure_service("mysql"));
+    ConnectParams {
+        kind: DbKind::MySql,
+        file_path: Default::default(),
+        host: "127.0.0.1".into(),
+        port: MYSQL_PORT,
+        database: "nbq".into(),
+        user: "nbq".into(),
+        password: Some("nbq".into()),
         ssl: SslMode::Disable,
         ssl_root_cert: String::new(),
         connect_timeout: Duration::from_secs(10),
