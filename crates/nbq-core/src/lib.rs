@@ -233,6 +233,11 @@ impl Workspace {
     pub fn closed(&mut self, root: &Path) {
         self.open.retain(|p| p != root);
     }
+
+    pub fn forget(&mut self, root: &Path) {
+        self.closed(root);
+        self.recent.retain(|p| p != root);
+    }
 }
 
 /// Read a TOML file; `None` if it doesn't exist.
@@ -365,6 +370,12 @@ mod tests {
         let w2 = store.load_workspace().unwrap();
         assert_eq!(w2.open, [PathBuf::from("C:/a")]);
         assert_eq!(w2.recent, [PathBuf::from("C:/a"), PathBuf::from("C:/b")]);
+
+        w.forget(Path::new("C:/a"));
+        store.save_workspace(&w).unwrap();
+        let w2 = store.load_workspace().unwrap();
+        assert!(w2.open.is_empty());
+        assert_eq!(w2.recent, [PathBuf::from("C:/b")]);
     }
 
     #[test]

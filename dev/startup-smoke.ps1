@@ -1,4 +1,4 @@
-# Exercise real native startup with broken configuration, without touching user settings.
+# Exercise real native startup with isolated configuration.
 param([string]$Executable = 'target/debug/not-bad-query.exe')
 $ErrorActionPreference = 'Stop'
 $binary = (Resolve-Path -LiteralPath $Executable).Path
@@ -29,19 +29,28 @@ public static class StartupSmoke {
 }
 '@
 $originalConfig = $env:NBQ_CONFIG_DIR
+$connectionProbe = $null
 try {
-    foreach ($case in @('clean', 'missing-project', 'bad-settings', 'bad-workspace', 'bad-connection')) {
+    foreach ($case in @('clean', 'missing-project', 'bad-settings', 'bad-workspace', 'bad-connection', 'saved-project')) {
         $config = Join-Path $fixtureRoot $case
         New-Item -ItemType Directory -Path $config | Out-Null
         switch ($case) {
             'missing-project' { [IO.File]::WriteAllText((Join-Path $config 'workspace.toml'), ("open = ['" + (Join-Path $config 'missing-project') + "']"), $utf8) }
             'bad-settings' { [IO.File]::WriteAllText((Join-Path $config 'settings.toml'), 'dark = [', $utf8) }
             'bad-workspace' { [IO.File]::WriteAllText((Join-Path $config 'workspace.toml'), 'open = [', $utf8) }
-            'bad-connection' {
+            { $_ -in @('bad-connection', 'saved-project') } {
                 $project = Join-Path $config 'project'
                 New-Item -ItemType Directory -Path (Join-Path $project 'connections') | Out-Null
                 [IO.File]::WriteAllText((Join-Path $project 'not-bad-query.toml'), "id = 'startup-test'`nname = 'Startup test'", $utf8)
-                [IO.File]::WriteAllText((Join-Path $project 'connections/bad.toml'), 'port = [', $utf8)
+                if ($case -eq 'bad-connection') {
+                    [IO.File]::WriteAllText((Join-Path $project 'connections/bad.toml'), 'port = [', $utf8)
+                } else {
+                    $connectionProbe = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, 0)
+                    $connectionProbe.Start()
+                    $port = $connectionProbe.LocalEndpoint.Port
+                    $profile = "kind = 'postgres'`nhost = '127.0.0.1'`nport = $port`ndatabase = 'postgres'`nssl = 'disable'"
+                    [IO.File]::WriteAllText((Join-Path $project 'connections/probe.toml'), $profile, $utf8)
+                }
                 [IO.File]::WriteAllText((Join-Path $config 'workspace.toml'), ("open = ['" + $project + "']"), $utf8)
             }
         }
@@ -57,6 +66,7 @@ try {
             [StartupSmoke]::Close($process.Id)
             if (-not $process.WaitForExit(5000)) { throw "Window did not close ($case)" }
             if ($process.ExitCode -ne 0) { throw "Nonzero exit ($case): $($process.ExitCode)" }
+            if ($case -eq 'saved-project' -and $connectionProbe.Pending()) { throw 'Startup attempted to connect to a saved profile' }
             Write-Output "PASS $case"
         } finally {
             $process.Refresh()
@@ -64,5 +74,6 @@ try {
         }
     }
 } finally {
+    if ($connectionProbe) { $connectionProbe.Stop() }
     $env:NBQ_CONFIG_DIR = $originalConfig
 }

@@ -2,7 +2,7 @@
 //! Owns the engine, the open projects and app config, and routes events.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -12,7 +12,7 @@ use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::component::Disableable as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::command::{Command, CommandItem, CommandState};
-use gpui_kit::component::dialog::{DialogAction, DialogClose, DialogFooter};
+use gpui_kit::component::dialog::{DialogAction, DialogClose, DialogEntrance, DialogFooter};
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::menu::ContextMenuExt as _;
 use gpui_kit::component::resizable::{h_resizable, resizable_panel};
@@ -25,7 +25,7 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use nbq_core::watch::ProjectWatcher;
-use nbq_core::{Connection, Credentials, Project, Settings, Store, Workspace};
+use nbq_core::{ConfigError, Connection, Credentials, Project, Settings, Store, Workspace};
 use nbq_engine::{ConnState, Engine, EngineOptions, Event, TabId};
 
 use crate::actions::*;
@@ -39,6 +39,7 @@ pub struct Workbench {
     store: Store,
     settings: Settings,
     workspace: Workspace,
+    project_recovery: VecDeque<UnavailableProject>,
     projects: Projects,
     watcher: Option<ProjectWatcher>,
     sidebar: Entity<Sidebar>,
@@ -50,12 +51,27 @@ pub struct Workbench {
     close_armed: Option<EntityId>,
     quit_dialog_open: bool,
     closing: bool,
-    csv_queue: std::collections::VecDeque<PathBuf>,
+    csv_queue: VecDeque<PathBuf>,
     csv_target: Option<PathBuf>,
     palette: Entity<CommandState>,
     focus: FocusHandle,
     _tasks: Vec<Task<()>>,
     _subs: Vec<Subscription>,
+}
+
+struct UnavailableProject {
+    root: PathBuf,
+    detail: Option<String>,
+    locating: bool,
+}
+
+impl UnavailableProject {
+    fn new(root: PathBuf, error: ConfigError) -> Self {
+        // Project::open reports a missing marker as a project error. The
+        // standard dialog text already covers that case.
+        let detail = (!matches!(error, ConfigError::Project(_))).then(|| error.to_string());
+        Self { root, detail, locating: false }
+    }
 }
 
 fn event_tab(ev: &Event) -> Option<TabId> {
@@ -177,7 +193,7 @@ impl Workbench {
             problems.push(e.to_string());
             Settings::default()
         });
-        let mut workspace = store.load_workspace().unwrap_or_else(|e| {
+        let workspace = store.load_workspace().unwrap_or_else(|e| {
             problems.push(e.to_string());
             Workspace::default()
         });
@@ -185,8 +201,9 @@ impl Workbench {
 
         let mut watcher = ProjectWatcher::new().map_err(|e| problems.push(e.to_string())).ok();
         let mut projects = Vec::new();
-        for root in workspace.open.clone() {
-            match Project::open(&root) {
+        let mut project_recovery = VecDeque::new();
+        for root in &workspace.open {
+            match Project::open(root) {
                 Ok(p) => {
                     problems.extend(p.warnings.iter().cloned());
                     if let Some(w) = watcher.as_mut() {
@@ -197,8 +214,7 @@ impl Workbench {
                     projects.push(p);
                 }
                 Err(e) => {
-                    problems.push(format!("Could not open project: {e}"));
-                    workspace.closed(&root);
+                    project_recovery.push_back(UnavailableProject::new(root.clone(), e));
                 }
             }
         }
@@ -236,6 +252,7 @@ impl Workbench {
             store,
             settings,
             workspace,
+            project_recovery,
             projects,
             watcher,
             sidebar,
@@ -253,15 +270,20 @@ impl Workbench {
             _tasks: vec![events, watch],
             _subs: subs,
         };
-        let first = wb.projects.borrow().first().and_then(|p| p.connections.connections.first().cloned());
-        wb.new_tab(first, None, window, cx);
+        wb.new_tab(None, None, window, cx);
         wb.check_csv_sources(window, cx);
         // The component Root is attached by open_window only after this builder
-        // returns. Notifications need its WindowState, even though init ran.
+        // returns. Notifications and dialogs need its WindowState.
+        let owner = cx.weak_entity();
         window.defer(cx, move |window, cx| {
             for problem in problems {
                 error(window, cx, problem);
             }
+            let _ = owner.update(cx, |wb, cx| {
+                if !wb.project_recovery.is_empty() {
+                    wb.show_project_recovery(window, cx);
+                }
+            });
         });
         let owner = cx.weak_entity();
         window.on_window_should_close(cx, move |window, cx| {
@@ -625,6 +647,10 @@ impl Workbench {
         if let Err(e) = self.store.save_workspace(&self.workspace) {
             error(window, cx, format!("Could not save workspace: {e}"));
         }
+        self.refresh_projects(cx);
+    }
+
+    fn refresh_projects(&mut self, cx: &mut Context<Self>) {
         let recent = self.workspace.recent.clone();
         self.sidebar.update(cx, |s, cx| {
             s.set_recent(recent, cx);
@@ -634,6 +660,12 @@ impl Workbench {
     }
 
     fn add_project(&mut self, p: Project, window: &mut Window, cx: &mut Context<Self>) {
+        self.workspace.opened(&p.root);
+        self.attach_project(p, window, cx);
+        self.save_workspace(window, cx);
+    }
+
+    fn attach_project(&mut self, p: Project, window: &mut Window, cx: &mut Context<Self>) {
         for w in &p.warnings {
             error(window, cx, w.clone());
         }
@@ -642,10 +674,8 @@ impl Workbench {
                 error(window, cx, e.to_string());
             }
         }
-        self.workspace.opened(&p.root);
         let key = p.key;
         self.projects.borrow_mut().push(p);
-        self.save_workspace(window, cx);
         // An empty, project-less tab joins the new project.
         if let Some(t) = self.reuse_empty_tab(cx) {
             t.update(cx, |t, _| {
@@ -662,14 +692,191 @@ impl Workbench {
         }
         match Project::open(&root) {
             Ok(p) => self.add_project(p, window, cx),
-            Err(e) => {
-                error(window, cx, e.to_string());
-                if !root.exists() {
-                    self.workspace.recent.retain(|r| r != &root);
-                    self.save_workspace(window, cx);
+            Err(e) if self.workspace.recent.contains(&root) || self.workspace.open.contains(&root) => {
+                let show_dialog = self.project_recovery.is_empty();
+                self.project_recovery.push_back(UnavailableProject::new(root, e));
+                if show_dialog {
+                    self.show_project_recovery(window, cx);
                 }
             }
+            Err(e) => error(window, cx, e.to_string()),
         }
+    }
+
+    fn show_project_recovery(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let owner = cx.weak_entity();
+        window.open_dialog(cx, move |dialog, _, cx| {
+            let Some(workbench) = owner.upgrade() else {
+                return dialog;
+            };
+            let Some(project) = workbench.read(cx).project_recovery.front() else {
+                return dialog;
+            };
+            let theme = cx.theme();
+            let locating = project.locating;
+            let path = project.root.display().to_string();
+            let title = project.root.file_name().map_or_else(
+                || "Couldn’t open project".to_string(),
+                |name| format!("Couldn’t open “{}”", name.to_string_lossy()),
+            );
+            let message = if project.detail.is_none() {
+                "The saved folder or its project file couldn’t be found."
+            } else {
+                "Choose the project’s folder to try opening it again."
+            };
+            let (remove, locate, dismiss) = (owner.clone(), owner.clone(), owner.clone());
+            dialog.title(div().pr_6().truncate().child(title))
+                .entrance(DialogEntrance::None)
+                .close_button(!locating)
+                .overlay_closable(false)
+                .child(
+                    v_flex()
+                        .gap_3()
+                        .text_sm()
+                        .child(div().text_color(theme.muted_foreground).child(message))
+                        .child(
+                            v_flex()
+                                .gap_1()
+                                .rounded_md()
+                                .border_1()
+                                .border_color(theme.border)
+                                .px_3()
+                                .py_2()
+                                .child(div().text_xs().text_color(theme.muted_foreground).child("Saved folder"))
+                                .child(
+                                    div().id("saved-project-folder")
+                                        .font_family(theme.mono_font_family.clone())
+                                        .text_xs()
+                                        .truncate()
+                                        .child(path.clone())
+                                        .tooltip(move |window, cx| Tooltip::new(path.clone()).build(window, cx)),
+                                ),
+                        )
+                        .when_some(project.detail.clone(), |el, detail| {
+                            el.child(div().text_color(theme.danger).child(detail))
+                        })
+                        .child(div().text_xs().text_color(theme.muted_foreground)
+                            .child("Removing the workspace entry only forgets the saved path.")),
+                )
+                .footer(
+                    DialogFooter::new()
+                        .justify_between()
+                        .child(
+                            Button::new("remove-unavailable-project")
+                                .ghost()
+                                .text_color(theme.muted_foreground)
+                                .label("Remove from workspace")
+                                .disabled(locating)
+                                .on_click(move |_, window, cx| {
+                                    let _ = remove.update(cx, |wb, cx| wb.resolve_project(None, window, cx));
+                                }),
+                        )
+                        .child(
+                            h_flex().gap_2()
+                                .child(div().w(px(80.)).child(DialogClose::new().trigger(move |button| {
+                                    button.outline().w_full().label("Dismiss").disabled(locating).tooltip("Keep the saved path")
+                                })))
+                                .child(DialogAction::new().child(
+                                    Button::new("locate-project")
+                                        .primary()
+                                        .label("Locate folder…")
+                                        .loading(locating),
+                                )),
+                        ),
+                )
+                .on_ok(move |_, window, cx| {
+                    let _ = locate.update(cx, |wb, cx| wb.locate_project(window, cx));
+                    false
+                })
+                .on_cancel(move |_, window, cx| {
+                    dismiss.update(cx, |wb, _| {
+                        if wb.project_recovery.front().is_some_and(|project| project.locating) {
+                            return false;
+                        }
+                        wb.project_recovery.pop_front();
+                        window.refresh();
+                        wb.project_recovery.is_empty()
+                    }).unwrap_or(true)
+                })
+        });
+    }
+
+    fn locate_project(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(project) = self.project_recovery.front_mut() else {
+            return;
+        };
+        if project.locating {
+            return;
+        }
+        project.locating = true;
+        window.refresh();
+        let mut picker = rfd::AsyncFileDialog::new()
+            .set_parent(window)
+            .set_title("Locate not-bad-query project");
+        if let Some(parent) = project.root.parent().filter(|path| !path.as_os_str().is_empty()) {
+            picker = picker.set_directory(parent);
+        }
+        cx.spawn_in(window, async move |this, cx| {
+            let opened = if let Some(dir) = picker.pick_folder().await {
+                let path = dir.path().to_path_buf();
+                Some(cx.background_executor().spawn(async move { Project::open(&path) }).await)
+            } else {
+                None
+            };
+            let _ = this.update_in(cx, |wb, window, cx| {
+                let Some(project) = wb.project_recovery.front_mut() else {
+                    return;
+                };
+                project.locating = false;
+                match opened {
+                    Some(Ok(p)) => wb.resolve_project(Some(p), window, cx),
+                    Some(Err(e)) => project.detail = Some(e.to_string()),
+                    None => {}
+                }
+                window.refresh();
+            });
+        }).detach();
+    }
+
+    fn resolve_project(
+        &mut self,
+        replacement: Option<Project>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(project) = self.project_recovery.front_mut() else {
+            return;
+        };
+        if project.locating || self.closing {
+            return;
+        }
+        let mut workspace = self.workspace.clone();
+        workspace.forget(&project.root);
+        if let Some(p) = &replacement {
+            workspace.opened(&p.root);
+        }
+        if let Err(e) = self.store.save_workspace(&workspace) {
+            project.detail = Some(format!("Could not save workspace: {e}"));
+            window.refresh();
+            return;
+        }
+        self.workspace = workspace;
+        let previous_root = project.root.clone();
+        self.project_recovery.retain(|pending| {
+            pending.root != previous_root && replacement.as_ref().is_none_or(|p| pending.root != p.root)
+        });
+        if let Some(p) = replacement {
+            let already_open = self.projects.borrow().iter().any(|open| open.root == p.root);
+            if !already_open {
+                self.attach_project(p, window, cx);
+                self.check_csv_sources(window, cx);
+            }
+        }
+        self.refresh_projects(cx);
+        if self.project_recovery.is_empty() {
+            window.close_dialog(cx);
+        }
+        window.refresh();
     }
 
     fn pick_project(&mut self, window: &mut Window, cx: &mut Context<Self>) {

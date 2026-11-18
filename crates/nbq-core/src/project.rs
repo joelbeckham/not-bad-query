@@ -118,13 +118,12 @@ impl Project {
 
     pub fn open(root: &Path) -> Result<Project> {
         let marker = root.join(MARKER);
-        if !marker.is_file() {
-            return Err(ConfigError::Project(format!(
+        let meta: ProjectMeta = read_toml(&marker)?.ok_or_else(|| {
+            ConfigError::Project(format!(
                 "{} is not a not-bad-query project (no {MARKER})",
                 root.display()
-            )));
-        }
-        let meta: ProjectMeta = read_toml(&marker)?.ok_or_else(|| ConfigError::Project(format!("{} disappeared", marker.display())))?;
+            ))
+        })?;
         let local = read_toml(&root.join(LOCAL_DIR).join(LOCAL_FILE))?.unwrap_or_default();
         let mut p = Project {
             key: NEXT_KEY.fetch_add(1, Ordering::Relaxed),
