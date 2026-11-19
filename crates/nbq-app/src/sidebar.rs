@@ -54,6 +54,7 @@ enum Node {
     Conn { key: String, color: Option<u32>, state: ConnState },
     Obj { conn: String, path: Option<ObjPath>, item: ObjItem },
     Note { error: bool },
+    VpnBlocked,
     ScriptDir { project: u32, dir: PathBuf },
     Script(PathBuf),
 }
@@ -68,6 +69,29 @@ impl Render for TreeDrag {
 
 /// (connection key, object path)
 type Key = (String, ObjPath);
+
+/// A Connect retry has no Objects event on failure, so reconcile cached errors
+/// with the latest session result rather than leaving an earlier VPN error.
+fn update_failed_objects(
+    loaded: &mut HashMap<Key, Result<Vec<ObjItem>, String>>,
+    conn: &str,
+    state: &ConnState,
+) -> Vec<ObjPath> {
+    let mut reload = Vec::new();
+    loaded.retain(|(key, path), result| {
+        if key != conn || result.is_ok() { return true; }
+        match state {
+            ConnState::Failed(error) => *result = Err(error.message.clone()),
+            ConnState::Connected => {
+                reload.push(path.clone());
+                return false;
+            }
+            _ => {}
+        }
+        true
+    });
+    reload
+}
 
 /// Surface failures even when another session for the same profile is healthy.
 fn combined_state<'a>(states: impl Iterator<Item = &'a ConnState>) -> ConnState {
@@ -89,6 +113,7 @@ fn status_text(state: &ConnState) -> &'static str {
         ConnState::Disconnected => "Disconnected",
         ConnState::Connecting => "Connecting…",
         ConnState::Connected => "Connected",
+        state if crate::vpn::blocked(state) => "VPN required",
         ConnState::Failed(_) => "Connection error",
     }
 }
@@ -253,7 +278,14 @@ impl Sidebar {
 
     pub fn on_metadata_state(&mut self, key: String, state: ConnState, cx: &mut Context<Self>) {
         if self.is_disconnected(&key) { return; }
-        self.metadata_states.insert(key, state);
+        let reload = update_failed_objects(&mut self.loaded, &key, &state);
+        self.metadata_states.insert(key.clone(), state);
+        for path in reload {
+            let id = if path == ObjPath::Root { format!("c:{key}").into() } else { obj_id(&key, &path) };
+            if self.expanded.contains(&id) {
+                self.ensure_loaded(&id);
+            }
+        }
         self.rebuild(cx);
     }
 
@@ -389,6 +421,11 @@ impl Sidebar {
                 nodes.insert(id.clone(), Node::Note { error: false });
                 vec![TreeItem::new(id, "Loading…")]
             }
+            Some(Err(_)) if self.metadata_states.get(conn).is_some_and(crate::vpn::blocked) => {
+                let id: SharedString = format!("{parent}/vpn").into();
+                nodes.insert(id.clone(), Node::VpnBlocked);
+                vec![TreeItem::new(id, "VPN required")]
+            }
             Some(Err(e)) => {
                 let id: SharedString = format!("{parent}/error").into();
                 nodes.insert(id.clone(), Node::Note { error: true });
@@ -466,7 +503,8 @@ impl Sidebar {
                 };
                 (icon, detail, Some(c), item.key)
             }
-            Some(Node::Note { error: true }) => (Icon::new(IconName::TriangleAlert), None, Some(theme.danger), false),
+            Some(Node::Note { error: true }) => (Icon::new(Lucide::CircleAlert), None, Some(theme.danger), false),
+            Some(Node::VpnBlocked) => (Icon::new(Lucide::ShieldOff), None, Some(theme.warning), false),
             Some(Node::Note { error: false }) => (Icon::new(IconName::LoaderCircle), None, Some(muted), false),
             Some(Node::Script(_)) => (Icon::new(Lucide::FileCode), None, Some(theme.green), false),
             None => (Icon::new(IconName::File), None, None, false),
@@ -495,9 +533,11 @@ impl Sidebar {
                     ConnState::Disconnected => (Lucide::Circle, muted),
                     ConnState::Connecting => (Lucide::LoaderCircle, theme.warning),
                     ConnState::Connected => (Lucide::CircleCheck, theme.success),
+                    state if crate::vpn::blocked(state) => (Lucide::ShieldOff, theme.warning),
                     ConnState::Failed(_) => (Lucide::CircleAlert, theme.danger),
                 };
                 let tip = match state {
+                    ConnState::Failed(e) if crate::vpn::blocked(state) => e.message.clone(),
                     ConnState::Failed(e) => format!("Connection error: {}", e.message),
                     _ => status_text(state).to_string(),
                 };
@@ -507,7 +547,11 @@ impl Sidebar {
                         Spinner::new().icon(IconName::LoaderCircle).xsmall().color(color)
                             .ease(|t| t).into_any_element()
                     } else {
-                        Icon::new(icon).xsmall().text_color(color).into_any_element()
+                        Icon::new(icon).xsmall().text_color(color)
+                            .when(matches!(state, ConnState::Failed(_)) && !crate::vpn::blocked(state), |icon| {
+                                icon.rounded_full().bg(theme.danger).text_color(theme.background)
+                            })
+                            .into_any_element()
                     })
                     .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx)))
             })
@@ -519,6 +563,7 @@ impl Sidebar {
                     .overflow_hidden()
                     .child(
                         div()
+                            .id(SharedString::from(format!("label:{entry_id}")))
                             .max_w_full()
                             .flex_shrink_0()
                             .text_sm()
@@ -527,6 +572,10 @@ impl Sidebar {
                             .text_ellipsis()
                             .when(strong, |d| d.font_weight(FontWeight::MEDIUM))
                             .when(section, |d| d.text_color(muted))
+                            .when(matches!(node, Some(Node::Note { error: true })), |d| {
+                                let message = label.clone();
+                                d.text_color(muted).tooltip(move |window, cx| Tooltip::new(message.clone()).build(window, cx))
+                            })
                             .child(label),
                     )
                     .when_some(detail, |el, d| {
@@ -884,7 +933,9 @@ impl Render for Sidebar {
 
 #[cfg(test)]
 mod tests {
-    use super::combined_state;
+    use super::{combined_state, update_failed_objects};
+    use std::collections::HashMap;
+    use nbq_engine::meta::ObjPath;
     use nbq_engine::ConnState;
 
     #[test]
@@ -894,5 +945,33 @@ mod tests {
         assert_eq!(combined_state([ConnState::Disconnected, ConnState::Connected].iter()), ConnState::Connected);
         assert_eq!(combined_state([ConnState::Connected, failed.clone()].iter()), failed);
         assert_eq!(combined_state([failed, ConnState::Connecting].iter()), ConnState::Connecting);
+    }
+
+    #[test]
+    fn connect_retry_replaces_cached_vpn_error_and_reloads_after_recovery() {
+        let root = ("c1".into(), ObjPath::Root);
+        let schema = ("c1".into(), ObjPath::Schema("shop".into()));
+        let healthy = ("c1".into(), ObjPath::Schema("public".into()));
+        let other = ("c2".into(), ObjPath::Root);
+        let vpn = "Connect to AWS Client VPN before opening this database.";
+        let mut loaded = HashMap::from([
+            (root.clone(), Err(vpn.into())),
+            (schema.clone(), Err(vpn.into())),
+            (healthy.clone(), Ok(Vec::new())),
+            (other.clone(), Err("other profile error".into())),
+        ]);
+        assert!(update_failed_objects(&mut loaded, "c1", &ConnState::Connecting).is_empty());
+        let auth = nbq_driver::DriverError::connection("password authentication failed for user postgres");
+        assert!(update_failed_objects(&mut loaded, "c1", &ConnState::Failed(auth.clone())).is_empty());
+        assert_eq!(loaded[&root], Err(auth.message.clone()));
+        assert_eq!(loaded[&schema], Err(auth.message));
+        assert_eq!(loaded[&other], Err("other profile error".into()));
+
+        let reload = update_failed_objects(&mut loaded, "c1", &ConnState::Connected);
+        assert_eq!(reload.len(), 2);
+        assert!(reload.contains(&root.1) && reload.contains(&schema.1));
+        assert!(!loaded.contains_key(&root) && !loaded.contains_key(&schema));
+        assert!(loaded[&healthy].is_ok());
+        assert!(loaded.contains_key(&other));
     }
 }

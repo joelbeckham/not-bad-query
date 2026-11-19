@@ -10,6 +10,7 @@ mod grid;
 mod query_tab;
 mod sidebar;
 mod ui;
+mod vpn;
 mod workbench;
 
 use gpui_kit::component::TitleBar;

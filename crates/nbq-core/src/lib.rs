@@ -68,6 +68,9 @@ pub struct Connection {
     pub ssl: SslMode,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub ssl_root_cert: String,
+    /// Check for AWS Client VPN before opening server sessions.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub vpn_required: bool,
     /// Palette name (`"red"`) or `#rrggbb`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub color: Option<String>,
@@ -86,6 +89,7 @@ pub struct Connection {
 
 fn path_is_empty(path: &Path) -> bool { path.as_os_str().is_empty() }
 fn is_zero(port: &u16) -> bool { *port == 0 }
+fn is_false(value: &bool) -> bool { !value }
 
 fn yes() -> bool {
     true
@@ -104,6 +108,7 @@ impl Connection {
             database: kind.default_database().into(),
             ssl: SslMode::VerifyFull,
             ssl_root_cert: String::new(),
+            vpn_required: false,
             color: None,
             autocommit: true,
             project_key: 0,
@@ -138,6 +143,7 @@ impl Connection {
             password: creds.password,
             ssl: self.ssl,
             ssl_root_cert: self.ssl_root_cert.clone(),
+            vpn_required: self.vpn_required && !self.kind.is_file_based(),
             connect_timeout: Duration::from_secs(10),
             application_name: "not-bad-query".into(),
         }
@@ -376,6 +382,19 @@ mod tests {
             toml::from_str("kind = \"postgres\"\nhost = \"localhost\"\nport = 5432\ndatabase = \"postgres\"\n").unwrap();
         assert!(c.autocommit && c.id.is_empty());
         assert_eq!(c.ssl, SslMode::Prefer);
+        assert!(!c.vpn_required);
+        assert!(!c.params(None).vpn_required);
+    }
+
+    #[test]
+    fn vpn_requirement_persists_for_server_profiles() {
+        let mut c = Connection::new("Protected database", DbKind::Postgres);
+        c.vpn_required = true;
+        let saved = toml::to_string(&c).unwrap();
+        let mut restored: Connection = toml::from_str(&saved).unwrap();
+        assert!(restored.params(None).vpn_required);
+        restored.kind = DbKind::Sqlite;
+        assert!(!restored.params(None).vpn_required);
     }
 
     #[test]

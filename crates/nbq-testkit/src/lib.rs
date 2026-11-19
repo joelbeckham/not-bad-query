@@ -53,6 +53,7 @@ pub fn pg() -> ConnectParams {
         password: Some("postgres".into()),
         ssl: SslMode::Disable,
         ssl_root_cert: String::new(),
+        vpn_required: false,
         connect_timeout: Duration::from_secs(10),
         application_name: "nbq-test".into(),
     }
@@ -72,6 +73,7 @@ pub fn mysql() -> ConnectParams {
         password: Some("nbq".into()),
         ssl: SslMode::Disable,
         ssl_root_cert: String::new(),
+        vpn_required: false,
         connect_timeout: Duration::from_secs(10),
         application_name: "nbq-test".into(),
     }

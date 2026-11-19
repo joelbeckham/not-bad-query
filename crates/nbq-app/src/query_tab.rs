@@ -382,7 +382,7 @@ impl QueryTab {
         match ev {
             Event::Conn { state, .. } => {
                 if !self.session_enabled && !matches!(state, ConnState::Disconnected) { return; }
-                if let ConnState::Failed(e) = &state {
+                if let ConnState::Failed(e) = &state && !crate::vpn::blocked(&state) {
                     window.push_notification(
                         gpui_kit::component::notification::Notification::error(format!("Connection failed: {e}")),
                         cx,
@@ -432,6 +432,7 @@ impl QueryTab {
                         };
                         Status::Done { message, elapsed }
                     }
+                    Outcome::Failed(error) if error.kind == nbq_driver::ErrorKind::VpnRequired => Status::Notice(error.message),
                     Outcome::Failed(error) => Status::Failed { error, elapsed },
                     Outcome::Cancelled => Status::Cancelled { elapsed },
                 };
@@ -492,6 +493,7 @@ impl QueryTab {
         let conn_icon = match &self.conn_state {
             ConnState::Connected => Icon::new(Lucide::Plug).text_color(color),
             ConnState::Connecting => Icon::new(IconName::LoaderCircle).text_color(theme.muted_foreground),
+            state if crate::vpn::blocked(state) => Icon::new(Lucide::ShieldOff).text_color(theme.warning),
             ConnState::Failed(_) => Icon::new(IconName::TriangleAlert).text_color(theme.danger),
             ConnState::Disconnected => Icon::new(Lucide::Unplug).text_color(theme.muted_foreground),
         };

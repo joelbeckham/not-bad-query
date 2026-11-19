@@ -41,6 +41,9 @@ nbq-app (GPUI views)  ──commands──▶  nbq-engine (tokio runtime)
   active query session separately, which may have expired while the object
   browser remains connected. Metadata state changes invalidate both displays.
   Connect opens the browser session and retries disconnected/failed tabs.
+  A failed reconnect replaces cached browser errors with the latest connection
+  failure, so an earlier VPN warning cannot hide an authentication error.
+  A successful reconnect reloads failed browser entries for any profile.
   Disconnect releases all of the profile's sessions and cancels pending connects,
   retaining scripts, their selected profiles, and already-fetched result rows.
   Disconnect asks before cancelling running queries and rolling back open
@@ -235,6 +238,21 @@ under `connections/` are discovered recursively. File headers distinguish engine
 when extensions overlap; active connections retain their known kind. Generated
 connection ids are persisted in local state. Explicit profiles referencing the
 same canonical file take precedence, avoiding duplicate tree entries.
+
+## AWS Client VPN
+
+Server profiles can set `vpn_required = true` through the **Require AWS Client VPN**
+checkbox. On Windows, the app checks the TAP adapter's
+operational and media state before starting a query or metadata session.
+A disconnected adapter or an unavailable status blocks the attempt before
+the driver opens a socket. The status bar updates from the local adapter
+state and opens the same prompt as a blocked connection. The prompt opens
+AWS VPN Client for profile selection and authentication. For a blocked
+profile, **Retry** becomes available when the VPN connects and opens the
+database connection without replaying SQL.
+
+The indicator reflects the local tunnel link. Database reachability still
+depends on the selected VPN profile, its routes, and database permissions.
 
 ## TLS and scripts
 

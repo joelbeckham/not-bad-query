@@ -134,6 +134,28 @@ async fn metadata_state(rx: &mut tokio::sync::mpsc::UnboundedReceiver<Event>) ->
 }
 
 #[tokio::test]
+async fn explicit_connect_reports_authentication_failure_and_recovers() {
+    let p = tokio::task::spawn_blocking(nbq_testkit::pg).await.unwrap();
+    let mut invalid = p.clone();
+    invalid.password = Some("nbq-intentionally-incorrect-password".into());
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target");
+    let dir = tempfile::tempdir_in(root).unwrap();
+    let (engine, mut rx) = Engine::new(EngineOptions::new(dir.path().into()));
+    engine.connect_profile("c1", &invalid);
+    assert_eq!(metadata_state(&mut rx).await, ConnState::Connecting);
+    let ConnState::Failed(error) = metadata_state(&mut rx).await else { panic!("expected failed authentication") };
+    assert_eq!(error.kind, nbq_driver::ErrorKind::Connection);
+    assert_eq!(error.code.as_deref(), Some("28P01"));
+    assert!(error.message.contains("password authentication failed"), "{error}");
+
+    engine.connect_profile("c1", &p);
+    assert_eq!(metadata_state(&mut rx).await, ConnState::Disconnected);
+    assert_eq!(metadata_state(&mut rx).await, ConnState::Connecting);
+    assert_eq!(metadata_state(&mut rx).await, ConnState::Connected);
+    assert!(!objects(&engine, &mut rx, &p, ObjPath::Root).await.is_empty());
+}
+
+#[tokio::test]
 async fn explicit_connect_disconnect_and_reconnect_releases_backend() {
     use nbq_driver::{Execution, display::cell_text};
     let mut p = tokio::task::spawn_blocking(nbq_testkit::pg).await.unwrap();

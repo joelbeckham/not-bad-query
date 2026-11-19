@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::dialog::{DialogAction, DialogClose, DialogFooter};
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::switch::Switch;
@@ -21,6 +22,7 @@ struct Choices {
     ssl: SslMode,
     color: Option<String>,
     autocommit: bool,
+    vpn_required: bool,
     ca: String,
     create: bool,
     busy: bool,
@@ -66,6 +68,7 @@ pub fn open(
         ssl: base.ssl,
         color: base.color.clone(),
         autocommit: base.autocommit,
+        vpn_required: base.vpn_required,
         ca: base.ssl_root_cert.clone(),
         create: false,
         busy: false,
@@ -259,7 +262,23 @@ pub fn open(
                             choices.borrow_mut().ca.clear(); window.refresh();
                         }))
                     })
-            )))
+            ))
+            .child(
+                h_flex().gap_2().items_center()
+                    .child(div().text_xs().text_color(theme.muted_foreground).w(px(40.)).child("VPN"))
+                    .child({
+                        let choices = choices.clone();
+                        Checkbox::new("vpn-required")
+                            .checked(ch.vpn_required)
+                            .label("Require AWS Client VPN")
+                            .tooltip("Check the VPN before opening this connection")
+                            .on_click(move |checked, window, _| {
+                                choices.borrow_mut().vpn_required = *checked;
+                                window.refresh();
+                            })
+                    }),
+            )
+            )
             .child(
                 h_flex()
                     .gap_2()
@@ -339,6 +358,7 @@ pub fn open(
                 c.ssl_root_cert = ch.ca.clone();
                 c.color = ch.color.clone();
                 c.autocommit = ch.autocommit;
+                c.vpn_required = ch.vpn_required && !ch.kind.is_file_based();
                 if ch.kind.is_file_based() {
                     let path = v(&file_path);
                     if path.is_empty() {

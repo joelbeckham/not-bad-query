@@ -26,7 +26,7 @@ async fn verified_tls_checks_chain_hostname_and_cancel_connection() {
         file_path: Default::default(),
         kind: DbKind::Postgres, host: "localhost".into(), port: lines[1].trim().parse().unwrap(),
         database: "postgres".into(), user: "postgres".into(), password: Some("postgres".into()),
-        ssl: SslMode::VerifyFull, ssl_root_cert: String::new(), connect_timeout: Duration::from_secs(5),
+        ssl: SslMode::VerifyFull, ssl_root_cert: String::new(), vpn_required: false, connect_timeout: Duration::from_secs(5),
         application_name: "nbq-tls-check".into(),
     };
     assert!(connect(&params).await.is_err(), "untrusted private CA must fail");

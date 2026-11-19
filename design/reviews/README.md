@@ -1,5 +1,39 @@
 # Native review evidence — 2026-11-13
 
+## VPN warning replaced by authentication error — 2026-11-18
+
+The rebuilt debug application ran with an isolated copy of `dev/sample-project`
+under `target/vpn-auth-review`, with `vpn_required = true` on the sample Prod
+connection. The native status bar reported VPN connected throughout. All input
+and screenshots targeted the preview process through window messages, without
+moving the user's pointer or changing application focus.
+
+A temporary role in the local development PostgreSQL container first rejected
+login. Enabling login while changing its password produced a password
+authentication error on explicit Connect. The tree replaced the previous error
+with that new failure. Restoring the expected password and choosing Connect
+cleared the cached failure and loaded the schemas. The preview was closed and
+the temporary role removed after verification.
+
+- `vpn-authentication-error.png` and `vpn-authentication-error-wide.png`: initial
+  authentication failure at default and expanded sidebar widths.
+- `vpn-authentication-error-final.png` and
+  `vpn-authentication-error-wide-final.png`: reviewed error-row presentation,
+  using a circle alert, secondary text, and a filled connection-failure badge.
+- `vpn-authentication-error-tooltip.png`: the full raw authentication message
+  remains readable on hover at the default sidebar width.
+- `vpn-authentication-recovered.png`: successful retry clears the failure and
+  reloads the schemas.
+
+Claude's first read-only T3 design review requested full-message hover access,
+consistent error glyphs, secondary error text, and a status badge distinct from
+the environment-colored database icon. Codex applied those changes. A fresh
+Claude recheck approved the final screenshots with no required changes.
+
+Validation: the sidebar cache regression passed; all six metadata integration
+tests passed against local PostgreSQL/MySQL, including authentication SQLSTATE
+`28P01` and credential recovery. The final debug application build passed.
+
 Screenshots captured from the debug Windows application with an isolated config
 and the local sample PostgreSQL project. Input messages targeted the preview's
 exact process/window; no global keyboard or mouse input was used.

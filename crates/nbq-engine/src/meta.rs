@@ -427,6 +427,7 @@ impl MetaConn {
             && self.params.kind == p.kind
             && self.params.ssl == p.ssl
             && self.params.ssl_root_cert == p.ssl_root_cert
+            && self.params.vpn_required == p.vpn_required
             && self.params.connect_timeout == p.connect_timeout
     }
 

@@ -31,6 +31,9 @@ arrow-cast = "60.1"
 tempfile.workspace = true
 mysql_async = { version = "0.37.1", default-features = false, features = ["minimal-rust", "rustls-tls", "ring", "tls12"] }
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis"] }
+
 [dev-dependencies]
 nbq-testkit.workspace = true
 arrow-array.workspace = true

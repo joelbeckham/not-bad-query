@@ -25,6 +25,7 @@ pub mod pg;
 pub mod sqlite;
 pub mod duckdb;
 mod mysql;
+pub mod vpn;
 pub mod csv_import;
 
 pub use nbq_sql::Dialect;
@@ -153,6 +154,7 @@ pub struct ConnectParams {
     pub ssl: SslMode,
     /// Optional public PEM roots, portable with a project. No private keys.
     pub ssl_root_cert: String,
+    pub vpn_required: bool,
     pub connect_timeout: Duration,
     /// Shown in `pg_stat_activity.application_name` and similar.
     pub application_name: String,
@@ -160,7 +162,7 @@ pub struct ConnectParams {
 
 impl ConnectParams {
     pub fn file(kind: DbKind, path: impl Into<std::path::PathBuf>) -> Self {
-        Self { kind, file_path: path.into(), host: String::new(), port: 0, database: String::new(), user: String::new(), password: None, ssl: SslMode::Disable, ssl_root_cert: String::new(), connect_timeout: Duration::from_secs(10), application_name: "not-bad-query".into() }
+        Self { kind, file_path: path.into(), host: String::new(), port: 0, database: String::new(), user: String::new(), password: None, ssl: SslMode::Disable, ssl_root_cert: String::new(), vpn_required: false, connect_timeout: Duration::from_secs(10), application_name: "not-bad-query".into() }
     }
 }
 
@@ -179,6 +181,8 @@ pub struct DriverError {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorKind {
+    /// A profile requires an active AWS Client VPN adapter before connecting.
+    VpnRequired,
     /// Network/auth failure; the session is unusable.
     Connection,
     /// The statement was cancelled by the user.
@@ -256,6 +260,10 @@ pub trait Session: Send {
 
 /// Open a session for `params`.
 pub async fn connect(params: &ConnectParams) -> Result<Box<dyn Session>> {
+    if params.vpn_required {
+        let status = tokio::task::spawn_blocking(vpn::status).await.unwrap_or(vpn::Status::Unavailable);
+        vpn::require_connected(status)?;
+    }
     match params.kind {
         DbKind::Postgres | DbKind::Redshift => Ok(Box::new(pg::PgSession::connect(params).await?)),
         DbKind::MySql => Ok(Box::new(mysql::MySqlSession::connect(params).await?)),

@@ -217,7 +217,7 @@ impl TabActor {
                     self.params = params;
                     self.emit_txn();
                     if self.params.is_some() {
-                        self.connect().await;
+                        let _ = self.connect().await;
                     } else {
                         self.emit(Event::Conn { tab: self.id, state: ConnState::Disconnected });
                     }
@@ -305,20 +305,20 @@ impl TabActor {
         self.shared.set_cancel(None);
     }
 
-    async fn connect(&mut self) -> bool {
-        let Some(p) = self.params.clone() else { return false };
+    async fn connect(&mut self) -> Result<(), DriverError> {
+        let p = self.params.clone().ok_or_else(|| DriverError::connection("no connection selected"))?;
         self.emit(Event::Conn { tab: self.id, state: ConnState::Connecting });
         let mut revision = self.shared.connection_revision.subscribe();
         let result = tokio::select! {
             biased;
-            _ = revision.wait_for(|r| *r != self.connection_revision) => return false,
+            _ = revision.wait_for(|r| *r != self.connection_revision) => return Err(DriverError::connection("connection changed")),
             result = nbq_driver::connect(&p) => result,
         };
         match result {
             Ok(mut s) => {
                 let configured = tokio::select! {
                     biased;
-                    _ = revision.wait_for(|r| *r != self.connection_revision) => return false,
+                        _ = revision.wait_for(|r| *r != self.connection_revision) => return Err(DriverError::connection("connection changed")),
                     result = tokio::time::timeout(p.connect_timeout,
                         s.configure_transaction_timeout(self.opts.transaction_idle_timeout.max(Duration::from_millis(1)))) => {
                         result.unwrap_or_else(|_| Err(DriverError::connection("Timed out configuring transaction inactivity protection.")))
@@ -327,19 +327,19 @@ impl TabActor {
                 match configured {
                     Ok(timeout) => self.idle_timeout = timeout,
                     Err(error) => {
-                        self.emit(Event::Conn { tab: self.id, state: ConnState::Failed(error) });
-                        return false;
+                        self.emit(Event::Conn { tab: self.id, state: ConnState::Failed(error.clone()) });
+                        return Err(error);
                     }
                 }
                 self.shared.set_cancel(Some(s.cancel_handle()));
                 self.session = Some(s);
                 self.shared.touch();
                 self.emit(Event::Conn { tab: self.id, state: ConnState::Connected });
-                true
+                Ok(())
             }
             Err(e) => {
-                self.emit(Event::Conn { tab: self.id, state: ConnState::Failed(e) });
-                false
+                self.emit(Event::Conn { tab: self.id, state: ConnState::Failed(e.clone()) });
+                Err(e)
             }
         }
     }
@@ -354,12 +354,14 @@ impl TabActor {
             }
             self.emit(Event::Conn { tab: self.id, state: ConnState::Disconnected });
         }
-        if self.session.is_none() && !self.connect().await {
-            return Err(DriverError::connection(if self.params.is_none() {
-                "no connection selected"
-            } else {
-                "could not connect"
-            }));
+        if self.session.is_none() {
+            self.connect().await.map_err(|error| {
+                if self.params.is_some() && error.kind != ErrorKind::VpnRequired {
+                    DriverError::connection("could not connect")
+                } else {
+                    error
+                }
+            })?;
         }
         Ok(())
     }

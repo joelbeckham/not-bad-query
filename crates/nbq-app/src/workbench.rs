@@ -26,6 +26,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use nbq_core::watch::ProjectWatcher;
 use nbq_core::{ConfigError, Connection, Credentials, Project, Settings, Store, Workspace};
+use nbq_driver::vpn::Status as VpnStatus;
 use nbq_engine::{ConnState, Engine, EngineOptions, Event, TabId};
 
 use crate::actions::*;
@@ -50,6 +51,8 @@ pub struct Workbench {
     /// A close that needs confirming (second Ctrl+W).
     close_armed: Option<EntityId>,
     quit_dialog_open: bool,
+    vpn_status: Option<VpnStatus>,
+    vpn_prompt_open: bool,
     closing: bool,
     csv_queue: VecDeque<PathBuf>,
     csv_target: Option<PathBuf>,
@@ -246,6 +249,24 @@ impl Workbench {
                 }
             }
         });
+        let mut tasks = vec![events, watch];
+        if cfg!(windows) {
+            tasks.push(cx.spawn_in(window, async move |this, cx| {
+                loop {
+                    let status = cx.background_executor().spawn(async { nbq_driver::vpn::status() }).await;
+                    if this.update_in(cx, |wb, window, cx| {
+                        if wb.vpn_status != Some(status) {
+                            wb.vpn_status = Some(status);
+                            window.refresh();
+                            cx.notify();
+                        }
+                    }).is_err() {
+                        break;
+                    }
+                    cx.background_executor().timer(Duration::from_secs(2)).await;
+                }
+            }));
+        }
         let palette = cx.new(|cx| CommandState::new(window, cx));
         let mut wb = Workbench {
             engine,
@@ -262,12 +283,14 @@ impl Workbench {
             next_untitled: 1,
             close_armed: None,
             quit_dialog_open: false,
+            vpn_status: None,
+            vpn_prompt_open: false,
             closing: false,
             csv_queue: Default::default(),
             csv_target: None,
             palette,
             focus: cx.focus_handle(),
-            _tasks: vec![events, watch],
+            _tasks: tasks,
             _subs: subs,
         };
         wb.new_tab(None, None, window, cx);
@@ -439,6 +462,12 @@ impl Workbench {
         if self.closing { return; }
         match ev {
             Event::MetadataConn { conn, state } => {
+                if crate::vpn::blocked(&state) && !self.sidebar.read(cx).is_disconnected(&conn) {
+                    let profile = connection(&self.projects.borrow(), &conn).filter(|c| c.vpn_required);
+                    if let Some(profile) = profile {
+                        self.prompt_vpn(Some(profile), window, cx);
+                    }
+                }
                 self.sidebar.update(cx, |s, cx| s.on_metadata_state(conn, state, cx));
                 cx.notify();
             }
@@ -456,6 +485,12 @@ impl Workbench {
             ev => {
                 let Some(tab_id) = event_tab(&ev) else { return };
                 let Some(tab) = self.tabs.iter().find(|t| t.read(cx).engine_tab == tab_id).cloned() else { return };
+                if matches!(&ev, Event::Conn { state, .. } if crate::vpn::blocked(state)) {
+                    let profile = tab.read(cx).conn.clone().filter(|c| c.vpn_required);
+                    if let Some(profile) = profile {
+                        self.prompt_vpn(Some(profile), window, cx);
+                    }
+                }
                 if let Event::Conn { state: ConnState::Connected, .. } = &ev {
                     if let Some(c) = tab.read(cx).conn.clone().filter(|_| tab.read(cx).session_enabled) {
                         self.sidebar.update(cx, |s, _| s.allow_connection(&c.key()));
@@ -468,6 +503,28 @@ impl Workbench {
                 cx.notify();
             }
         }
+    }
+
+    fn prompt_vpn(&mut self, profile: Option<Connection>, window: &mut Window, cx: &mut Context<Self>) {
+        if self.vpn_prompt_open || self.closing {
+            return;
+        }
+        self.vpn_prompt_open = true;
+        let key = profile.as_ref().map(Connection::key);
+        let profile = profile.map(|c| c.name);
+        let (status, retry, owner) = (cx.weak_entity(), cx.weak_entity(), cx.weak_entity());
+        crate::vpn::prompt(
+            profile, window, cx,
+            move |cx| status.upgrade().and_then(|wb| wb.read(cx).vpn_status),
+            move |window, cx| {
+                if let Some(key) = &key {
+                    let _ = retry.update(cx, |wb, cx| {
+                        wb.on_sidebar(&SidebarEvent::Connect(key.clone()), window, cx);
+                    });
+                }
+            },
+            move |cx| { let _ = owner.update(cx, |wb, _| wb.vpn_prompt_open = false); },
+        );
     }
 
     fn reuse_empty_tab(&self, cx: &App) -> Option<Entity<QueryTab>> {
@@ -1518,6 +1575,9 @@ impl Workbench {
 
     fn render_status(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
+        let show_vpn = cfg!(windows) && (matches!(self.vpn_status, Some(VpnStatus::Connected | VpnStatus::Disconnected))
+            || self.projects.borrow().iter().any(|p| p.connections.connections.iter().any(|c| c.vpn_required)));
+        let vpn_needed = self.active_tab().and_then(|t| t.read(cx).conn.as_ref()).is_some_and(|c| c.vpn_required);
         let left = self.active_tab().map(|t| {
             let t = t.read(cx);
             match &t.conn {
@@ -1526,6 +1586,7 @@ impl Workbench {
                     let state = match &profile_state {
                         ConnState::Connected => ("connected", theme.success),
                         ConnState::Connecting => ("connecting…", theme.warning),
+                        state if crate::vpn::blocked(state) => ("VPN required", theme.warning),
                         ConnState::Failed(_) => ("failed", theme.danger),
                         ConnState::Disconnected => ("disconnected", theme.muted_foreground),
                     };
@@ -1561,6 +1622,29 @@ impl Workbench {
             .right(
                 h_flex()
                     .gap_3()
+                    .when(show_vpn, |row| {
+                        let offline = if vpn_needed { theme.warning } else { theme.muted_foreground };
+                        let (icon, label, color) = match self.vpn_status {
+                            Some(VpnStatus::Connected) => (Lucide::ShieldCheck, "VPN connected", theme.success),
+                            Some(VpnStatus::Disconnected) => (Lucide::ShieldOff, "VPN disconnected", offline),
+                            Some(VpnStatus::Unavailable) => (Lucide::ShieldAlert, "VPN unavailable", offline),
+                            None => (Lucide::Shield, "Checking VPN…", theme.muted_foreground),
+                        };
+                        let can_open = matches!(self.vpn_status, Some(VpnStatus::Disconnected | VpnStatus::Unavailable));
+                        row.child(
+                            Button::new("aws-vpn-status")
+                                .xsmall()
+                                .ghost()
+                                .icon(Icon::new(icon))
+                                .label(label)
+                                .text_color(color)
+                                .tooltip(if can_open { "Open VPN status" } else { "AWS Client VPN" })
+                                .tab_stop(can_open)
+                                .when(can_open, |button| button.on_click(cx.listener(|this, _, window, cx| {
+                                    this.prompt_vpn(None, window, cx);
+                                }))),
+                        )
+                    })
                     .child("Ctrl+K commands")
                     .child(
                         Button::new("theme")
