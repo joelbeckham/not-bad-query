@@ -290,6 +290,8 @@ A project is a folder, often a subfolder of a git repo (`repo/queries/`). The la
 not-bad-query.toml                    id + name (marks the folder as a project)
 connections/<folder>/<Name>.toml   one file per connection; name and folder come from the path
 scripts/...                        SQL files
+skills/<name>/SKILL.md             SQL assistant skill with YAML front matter
+skills/<name>/references/...       Optional Markdown references
 exports/                           CSV export default (git-ignored)
 .not-bad-query/local.toml             per-user state, e.g. script -> last connection (git-ignored)
 ```
@@ -303,6 +305,17 @@ exports/                           CSV export default (git-ignored)
   caches, catalogs and tree ids use that key, so two copies of a project never collide.
 - A `notify` watcher records changed paths; the workbench polls it, reloads projects whose
   `connections/` or `scripts/` changed, and reconnects tabs whose connection settings changed.
+
+## SQL assistant skills
+
+The assistant discovers Agent Skills in the active tab's project. Each skill's
+folder name matches the `name` in its YAML front matter. The `description`
+explains when to use the skill. Requests include these two fields so the model
+can decide which `SKILL.md` files to open. A skill can link to supporting
+Markdown using paths relative to the skill folder, such as
+`[Revenue rules](references/revenue.md)`. The assistant reads linked files on
+demand, up to 64 KiB per file. Accepting a proposed change writes the reviewed
+`SKILL.md`.
 
 ## Testing
 

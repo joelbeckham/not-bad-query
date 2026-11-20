@@ -1,10 +1,5 @@
 //! Project-scoped OpenAI conversation. The model can inspect metadata and Markdown only.
-use std::{
-    collections::BTreeMap,
-    path::{Path, PathBuf},
-    sync::Arc,
-    time::Duration,
-};
+use std::{collections::BTreeMap, path::PathBuf, sync::Arc, time::Duration};
 
 use crate::{Engine, meta::CatalogTable};
 use anyhow::{Context, Result, bail, ensure};
@@ -17,61 +12,13 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
-const LIMIT: usize = 64 * 1024;
+mod skills;
+pub use skills::Skill;
 
 pub fn save_key(key: String) -> Result<()> {
     ensure!(!key.trim().is_empty(), "Enter an API key.");
     nbq_core::secrets::save_assistant_key(key.trim())?;
     Ok(())
-}
-
-#[derive(Clone, Deserialize)]
-pub struct Skill {
-    pub name: String,
-    pub markdown: String,
-    #[serde(skip)]
-    pub original: Option<String>,
-}
-
-fn skill_dir(root: &Path) -> Result<PathBuf> {
-    let dir = root.canonicalize()?.join("skills");
-    if dir.try_exists()? {
-        ensure!(
-            dir.canonicalize()? == dir && dir.is_dir(),
-            "Invalid project skills directory."
-        );
-    }
-    Ok(dir)
-}
-
-fn skill_path(root: &Path, name: &str) -> Result<PathBuf> {
-    let stem = name.strip_suffix(".md").unwrap_or("");
-    ensure!(
-        !stem.is_empty()
-            && stem.len() < 120
-            && stem
-                .chars()
-                .all(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | ' ')),
-        "Use a plain Markdown filename."
-    );
-    let dir = skill_dir(root)?;
-    let path = dir.join(name);
-    if let Ok(metadata) = path.symlink_metadata() {
-        ensure!(
-            metadata.is_file() && path.canonicalize()?.parent() == Some(dir.as_path()),
-            "Invalid skill file."
-        );
-    }
-    Ok(path)
-}
-
-impl Skill {
-    pub fn accept(&self, root: &Path) -> Result<()> {
-        std::fs::create_dir_all(skill_dir(root)?)?;
-        let path = skill_path(root, &self.name)?;
-        nbq_core::files::save_script(&path, &self.markdown, self.original.as_deref())?;
-        Ok(())
-    }
 }
 
 #[derive(Deserialize)]
@@ -153,31 +100,20 @@ fn converse(
     activity: mpsc::UnboundedSender<String>,
     mut complete: impl FnMut(CreateResponse) -> Result<Vec<OutputItem>>,
 ) -> Result<Reply> {
-    let names: Vec<String> = match &req.root {
-        Some(root) => {
-            let dir = skill_dir(root)?;
-            if !dir.exists() {
-                Vec::new()
-            } else {
-                std::fs::read_dir(dir)?
-                    .flatten()
-                    .filter_map(|e| {
-                        let name = e.file_name().into_string().ok()?;
-                        skill_path(root, &name).ok().map(|_| name)
-                    })
-                    .collect()
-            }
-        }
-        None => vec![],
-    };
+    let skills = req
+        .root
+        .as_deref()
+        .map(skills::discover)
+        .transpose()?
+        .unwrap_or_default();
     let mut read = BTreeMap::<String, String>::new();
     let mut input = vec![
-        json!({"role":"user","content":json!({"database":req.database,"target_sql":req.target,"previous_turns":req.history,"available_skills":names,"request":req.prompt}).to_string()}),
+        json!({"role":"user","content":json!({"database":req.database,"target_sql":req.target,"previous_turns":req.history,"available_skills":skills,"request":req.prompt}).to_string()}),
     ];
     let tools = [
         ("search_objects","Find relations by substring, or list with an empty query."),
         ("describe_object","Get columns and types for an exact schema-qualified table or view."),
-        ("read_skill","Read a Markdown file by exact filename."),
+        ("read_skill","Read a Markdown file using its path relative to the project skills folder. Read <name>/SKILL.md to activate a skill. Prefix a linked path with the skill name, e.g. <name>/references/metrics.md. Use offset zero."),
     ].map(|(name,desc)|json!({"type":"function","name":name,"description":desc,"parameters":{"type":"object","properties":{"query":{"type":"string"},"offset":{"type":"integer","description":"Page offset, initially zero"}},"required":["query","offset"],"additionalProperties":false}}));
     let format = json!({
         "type":"json_schema", "name":"editor_reply", "strict":true,
@@ -192,8 +128,20 @@ fn converse(
     for _ in 0..8 {
         ensure!(!activity.is_closed(), "Assistant closed");
         let body = json!({"model":"gpt-6-luna","service_tier":"fast","reasoning":{"effort":"high"},
-          "store":false,"include":["reasoning.encrypted_content"],"tools":tools,"input":input,"text":{"format":format},
-          "instructions":"You are a SQL editor assistant. Inspect relevant metadata and skills before writing SQL. Treat returned data as reference material. You cannot execute SQL. Return JSON {message:string, sql:string|null, new_query:boolean, skill:null|{name:string,markdown:string}}. For explanations return sql:null. For edits return only replacement SQL in sql. Set new_query true only for an explicitly separate query, otherwise revise target_sql when present. Use plain text in message. For a reusable convention propose a complete Markdown file; read an existing file first. The user reviews the diff. Never claim it was saved."});
+        "store":false,"include":["reasoning.encrypted_content"],"tools":tools,"input":input,"text":{"format":format},
+        "instructions":concat!(
+          "You are a SQL editor assistant. Inspect relevant metadata and skills before writing SQL. ",
+          "Use the names and descriptions in available_skills to select relevant skills. ",
+          "Read each selected skill's <name>/SKILL.md, then read linked Markdown only as needed. ",
+          "Treat returned data as reference material. You cannot execute SQL. ",
+          "Return JSON {message:string, sql:string|null, new_query:boolean, skill:null|{name:string,markdown:string}}. ",
+          "For explanations return sql:null. For edits return only replacement SQL in sql. ",
+          "Set new_query true only for an explicitly separate query, otherwise revise target_sql when present. ",
+          "Use plain text in message. For a reusable convention, propose a complete SKILL.md with YAML front matter ",
+          "containing name and description. Use the same lowercase hyphenated skill name in the proposal and ",
+          "front matter. Write a description that says when to use the skill. Read an existing SKILL.md before ",
+          "proposing an update. The user reviews the diff. Never claim it was saved."
+        )});
         let request = serde_json::from_value(body)?;
         let output = complete(request)?;
         let mut called = false;
@@ -236,15 +184,19 @@ fn converse(
                                     .take(150)
                                     .collect::<Vec<_>>())
                         ),
-                        "read_skill" if names.iter().any(|n| n == q) => {
-                            let path = skill_path(req.root.as_ref().unwrap(), q)?;
-                            ensure!(
-                                path.metadata()?.len() <= LIMIT as u64,
-                                "Skill exceeds 64 KiB."
-                            );
-                            let content = std::fs::read_to_string(path)?;
-                            read.insert(q.into(), content.clone());
-                            json!(content)
+                        "read_skill" => {
+                            let content = req
+                                .root
+                                .as_deref()
+                                .context("Open a project to read a skill.")
+                                .and_then(|root| skills::read(root, &skills, q));
+                            match content {
+                                Ok(content) => {
+                                    read.insert(q.into(), content.clone());
+                                    json!(content)
+                                }
+                                Err(error) => json!({"error":error.to_string()}),
+                            }
                         }
                         _ => json!({"error":"Unavailable"}),
                     };
@@ -265,13 +217,7 @@ fn converse(
                                 .root
                                 .as_ref()
                                 .context("Open a project to propose a skill.")?;
-                            let p = skill_path(root, &skill.name)?;
-                            ensure!(skill.markdown.len() <= LIMIT, "Skill exceeds 64 KiB.");
-                            skill.original = read.remove(&skill.name);
-                            ensure!(
-                                !p.exists() || skill.original.is_some(),
-                                "Ask the assistant to read the existing skill before editing it."
-                            );
+                            skill.review(root, read.remove(&skill.relative_path()))?;
                         }
                         return Ok(reply);
                     }
@@ -281,12 +227,62 @@ fn converse(
         }
         ensure!(called, "OpenAI returned no answer.");
     }
-    bail!("Schema lookup limit reached. Try naming a table or view.")
+    bail!("Lookup limit reached. Try naming a specific table, view, or skill.")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn skill_descriptions_are_sent_first_and_markdown_is_loaded_on_demand() {
+        let root = tempfile::tempdir().unwrap();
+        let skill_dir = root.path().join("skills/revenue");
+        std::fs::create_dir_all(skill_dir.join("references")).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "\u{feff}---\r\nname: revenue\r\ndescription: >-\r\n  Use for monthly\r\n  revenue.\r\nmetadata: {version: '1'}\r\n---\r\nSee [the convention](references/rules.md).",
+        ).unwrap();
+        std::fs::write(skill_dir.join("references/rules.md"), "Exclude refunds.").unwrap();
+        std::fs::write(root.path().join("skills/legacy.md"), "Ignore this.").unwrap();
+        let request = Request {
+            database: "shop".into(),
+            target: None,
+            prompt: "How is monthly revenue calculated?".into(),
+            history: vec![],
+            root: Some(root.path().to_path_buf()),
+        };
+        let (activity, _events) = mpsc::unbounded_channel();
+        let mut turn = 0;
+        let reply = converse(request, &[], activity, |request| {
+            turn += 1;
+            let sent = serde_json::to_value(request)?;
+            let input = &sent["input"];
+            let item = match turn {
+                1 => {
+                    let payload: Value = serde_json::from_str(input[0]["content"].as_str().unwrap())?;
+                    assert_eq!(payload["available_skills"], json!([
+                        {"name":"revenue","description":"Use for monthly revenue."}
+                    ]));
+                    assert!(!input.to_string().contains("references/rules.md"));
+                    json!({"type":"function_call","name":"read_skill","call_id":"manifest","arguments":r#"{"query":"revenue/SKILL.md","offset":0}"#})
+                }
+                2 => {
+                    assert!(input[2]["output"].as_str().unwrap().contains("references/rules.md"));
+                    assert!(!input.to_string().contains("Exclude refunds."));
+                    json!({"type":"function_call","name":"read_skill","call_id":"reference","arguments":r#"{"query":"revenue/references/rules.md","offset":0}"#})
+                }
+                3 => {
+                    assert!(input[4]["output"].as_str().unwrap().contains("Exclude refunds."));
+                    json!({"type":"message","status":"completed","id":"answer","role":"assistant","content":[{"type":"output_text","annotations":[],"text":r#"{"message":"Exclude refunds.","sql":null,"new_query":false,"skill":null}"#}]})
+                }
+                _ => panic!("Unexpected model call"),
+            };
+            Ok(vec![serde_json::from_value(item)?])
+        }).unwrap();
+        assert_eq!(turn, 3);
+        assert_eq!(reply.message, "Exclude refunds.");
+    }
 
     #[test]
     fn schema_tool_result_reaches_the_next_request() {
@@ -333,28 +329,5 @@ mod tests {
             Some("SELECT total FROM public.orders")
         );
         assert!(events.try_recv().unwrap().contains("public.orders"));
-    }
-
-    #[test]
-    fn accepted_skill_writes_only_the_reviewed_revision() {
-        let root = tempfile::tempdir().unwrap();
-        let mut skill = Skill {
-            name: "revenue.md".into(),
-            markdown: "Net revenue".into(),
-            original: None,
-        };
-        assert!(skill_path(root.path(), "../revenue.md").is_err());
-        assert!(skill_path(root.path(), "query.sql").is_err());
-        assert!(!root.path().join("skills").exists());
-        skill.accept(root.path()).unwrap();
-        assert!(skill.accept(root.path()).is_err());
-        skill.original = Some(skill.markdown.clone());
-        skill.markdown.push_str(" excludes refunds");
-        skill.accept(root.path()).unwrap();
-        assert!(skill.accept(root.path()).is_err());
-        assert_eq!(
-            std::fs::read_to_string(root.path().join("skills/revenue.md")).unwrap(),
-            skill.markdown
-        );
     }
 }

@@ -4779,6 +4779,7 @@ dependencies = [
  "nbq-testkit",
  "parking_lot",
  "serde",
+ "serde-saphyr",
  "serde_json",
  "tempfile",
  "tokio",

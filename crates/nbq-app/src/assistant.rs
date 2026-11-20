@@ -483,7 +483,7 @@ impl Render for Assistant {
         if let Some((_, skill, diff)) = &self.skill {
             chat = chat
                 .child(heading("Suggested skill update"))
-                .child(format!("skills/{}", skill.name))
+                .child(format!("skills/{}", skill.relative_path()))
                 .child(div().text_xs().child(diff.clone()))
                 .child(
                     h_flex()
