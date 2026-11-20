@@ -20,6 +20,17 @@ pub fn save_script(path: &Path, text: &str, expected: Option<&str>) -> io::Resul
     if text.len() as u64 > MAX_SCRIPT_BYTES {
         return Err(io::Error::other("Scripts larger than 8 MiB are not supported"));
     }
+    // An empty scripts directory may be absent in a project checked out from git.
+    if expected.is_none()
+        && let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty())
+        && !parent.is_dir()
+    {
+        match std::fs::create_dir(parent) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists && parent.is_dir() => {}
+            Err(error) => return Err(error),
+        }
+    }
     write_atomic(path, text, expected, false)
 }
 
@@ -50,6 +61,17 @@ pub(crate) fn write_atomic(path: &Path, text: &str, expected: Option<&str>, repl
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn first_save_creates_a_missing_scripts_directory() {
+        let project = tempfile::tempdir().unwrap();
+        let scripts = project.path().join("scripts");
+        let path = scripts.join("report.sql");
+        assert!(save_script(&path, "select 2", Some("select 1")).is_err());
+        assert!(!scripts.exists());
+        save_script(&path, "select 1", None).unwrap();
+        assert_eq!(read_script(&path).unwrap(), "select 1");
+    }
 
     #[test]
     fn save_preserves_external_edits_and_existing_destinations() {
