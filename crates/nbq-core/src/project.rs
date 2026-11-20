@@ -98,7 +98,7 @@ impl Project {
         if Self::is_project(root) {
             return Err(ConfigError::Project(format!("{} is already a not-bad-query project", root.display())));
         }
-        for d in [CONNECTIONS_DIR, SCRIPTS_DIR, EXPORTS_DIR, LOCAL_DIR] {
+        for d in [CONNECTIONS_DIR, SCRIPTS_DIR, EXPORTS_DIR, LOCAL_DIR, "skills"] {
             let p = root.join(d);
             std::fs::create_dir_all(&p).map_err(io_err(&p))?;
         }

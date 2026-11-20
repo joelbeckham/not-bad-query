@@ -11,6 +11,7 @@ name = "not-bad-query"
 path = "src/main.rs"
 
 [dependencies]
+similar = "2.7"
 gpui-kit = { version = "0.9.1", features = ["tree-sitter-sql"] }
 nbq-core.workspace = true
 nbq-driver.workspace = true

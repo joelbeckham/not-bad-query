@@ -316,6 +316,21 @@ pub mod secrets {
 
     const SERVICE: &str = "not-bad-query";
 
+    pub fn assistant_key() -> Result<Option<String>> {
+        let entry = keyring::Entry::new("not-bad-query-assistant", "openai")
+            .map_err(|e| ConfigError::Secret(e.to_string()))?;
+        match entry.get_password() {
+            Ok(key) => Ok(Some(key)),
+            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(e) => Err(ConfigError::Secret(e.to_string())),
+        }
+    }
+
+    pub fn save_assistant_key(key: &str) -> Result<()> {
+        keyring::Entry::new("not-bad-query-assistant", "openai").and_then(|e| e.set_password(key))
+            .map_err(|e| ConfigError::Secret(e.to_string()))
+    }
+
     #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
     pub struct Credentials {
         pub user: String,

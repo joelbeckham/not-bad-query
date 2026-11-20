@@ -7,6 +7,10 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+async-openai = { version = "0.43", default-features = false, features = ["responses", "native-tls"] }
 nbq-sql.workspace = true
 nbq-core.workspace = true
 nbq-driver.workspace = true

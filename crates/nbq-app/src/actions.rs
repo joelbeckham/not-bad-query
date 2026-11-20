@@ -31,6 +31,7 @@ actions!(
         FocusResults,
         FocusSidebar,
         ToggleTheme,
+        ToggleAssistant,
     ]
 );
 
@@ -40,6 +41,8 @@ pub fn bindings() -> Vec<KeyBinding> {
         // Bound in "SqlEditor > Input" so it beats the editor's own ctrl-enter.
         KeyBinding::new("ctrl-enter", RunStatement, Some("SqlEditor > Input")),
         KeyBinding::new("ctrl-enter", RunStatement, Some("Workbench")),
+        KeyBinding::new("ctrl-enter", RunStatement, Some("Assistant > Input")),
+        KeyBinding::new("ctrl-4", ToggleAssistant, Some("Workbench")),
         KeyBinding::new("alt-x", RunScript, Some("Workbench")),
         KeyBinding::new("alt-x", RunScript, Some("SqlEditor > Input")),
         KeyBinding::new("ctrl-.", CancelQuery, Some("SqlEditor > Input")),
@@ -85,5 +88,6 @@ pub fn palette() -> Vec<(&'static str, &'static str, Box<dyn Action>)> {
         ("Open project…", "", Box::new(OpenProject)),
         ("New connection…", "", Box::new(NewConnection)),
         ("Toggle light/dark theme", "", Box::new(ToggleTheme)),
+        ("Toggle SQL assistant", "Ctrl+4", Box::new(ToggleAssistant)),
     ]
 }

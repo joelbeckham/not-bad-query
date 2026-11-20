@@ -7,6 +7,7 @@
 //! rows into a [`Spool`] on demand.
 
 mod fetch;
+pub mod assistant;
 pub mod meta;
 mod tab;
 pub mod csv_import;

@@ -38,6 +38,7 @@ pub enum Status {
 }
 
 pub struct QueryTab {
+    pub assistant: Entity<crate::assistant::Assistant>,
     pub engine_tab: TabId,
     engine: Arc<Engine>,
     pub conn: Option<Connection>,
@@ -81,6 +82,8 @@ impl QueryTab {
         cx: &mut Context<Self>,
     ) -> Self {
         let engine_tab = engine.open_tab();
+        let tab = cx.weak_entity();
+        let assistant = cx.new(|cx| crate::assistant::Assistant::new(tab, engine.clone(), catalogs.clone(), projects.clone(), window, cx));
         let completer_conn = Rc::new(RefCell::new(None));
         let completer_dialect = Rc::new(std::cell::Cell::new(nbq_sql::Dialect::Postgres));
         let editor = cx.new(|cx| {
@@ -103,6 +106,7 @@ impl QueryTab {
             }
         })];
         QueryTab {
+            assistant,
             engine_tab,
             engine,
             conn: None,
@@ -158,6 +162,9 @@ impl QueryTab {
             return;
         }
         let params = conn.as_ref().map(crate::ui::params_for);
+        if self.conn != conn {
+            self.assistant.update(cx, |a, cx| a.reset(cx));
+        }
         let autocommit = conn.as_ref().map(|c| c.autocommit).unwrap_or(true);
         *self.completer_conn.borrow_mut() = conn.as_ref().map(|c| c.key());
         self.completer_dialect.set(conn.as_ref().map(|c| c.kind.dialect()).unwrap_or(nbq_sql::Dialect::Postgres));
@@ -205,6 +212,9 @@ impl QueryTab {
     /// adopt that file's project, dropping a connection from another one.
     pub fn set_path(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         let project = crate::ui::project_for_path(&self.projects.borrow(), &path);
+        if project != self.project && (project.is_some() || self.conn.is_none()) {
+            self.assistant.update(cx, |a, cx| a.reset(cx));
+        }
         self.path = Some(path);
         if project.is_some() || self.conn.is_none() {
             self.project = project;
@@ -354,6 +364,7 @@ impl QueryTab {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.assistant.update(cx, |a, cx| a.reset(cx));
         self.editor.update(cx, |e, cx| e.set_value(text, window, cx));
         self.project = crate::ui::project_for_path(&self.projects.borrow(), &path);
         self.path = Some(path);
@@ -607,6 +618,10 @@ impl QueryTab {
                 )
             })
             .child(div().flex_1())
+            .child(Button::new("assistant-toggle").ghost().small()
+                .icon(Icon::new(Lucide::PanelRight)).label("Assistant")
+                .tooltip("Toggle SQL assistant (Ctrl+4)")
+                .on_click(|_, window, cx| window.dispatch_action(Box::new(crate::actions::ToggleAssistant), cx)))
             .when_some(running, |el, d| {
                 el.child(
                     h_flex()

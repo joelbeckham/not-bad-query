@@ -36,6 +36,7 @@ use crate::sidebar::{Sidebar, SidebarEvent};
 use crate::ui::{Projects, conn_color, connection, project_for_path};
 
 pub struct Workbench {
+    assistant_open: bool,
     engine: Arc<Engine>,
     store: Store,
     settings: Settings,
@@ -279,6 +280,7 @@ impl Workbench {
             sidebar,
             tabs: Vec::new(),
             active: 0,
+            assistant_open: false,
             catalogs: Rc::new(RefCell::new(HashMap::new())),
             next_untitled: 1,
             close_armed: None,
@@ -531,6 +533,7 @@ impl Workbench {
         self.active_tab().cloned().filter(|t| {
             let t = t.read(cx);
             t.path.is_none() && t.text(cx).trim().is_empty() && !t.is_running() && !t.txn.in_txn && !t.saving
+                && !t.assistant.read(cx).in_use(cx)
         })
     }
 
@@ -1302,7 +1305,10 @@ impl Workbench {
     /// Run a command by action (used by key bindings and the palette).
     fn perform(&mut self, action: &dyn Action, window: &mut Window, cx: &mut Context<Self>) {
         let a = action.as_any();
-        if a.is::<RunStatement>() {
+        if a.is::<ToggleAssistant>() {
+            self.assistant_open = !self.assistant_open;
+            cx.notify();
+        } else if a.is::<RunStatement>() {
             self.with_active(cx, |t, cx| t.run_statement(cx));
         } else if a.is::<RunScript>() {
             self.with_active(cx, |t, cx| t.run_script(cx));
@@ -1701,7 +1707,7 @@ impl Render for Workbench {
             root, cx, RunStatement, RunScript, CancelQuery, Commit, Rollback, ToggleAutocommit, NewTab, CloseTab,
             NextTab, PrevTab, SaveFile, SaveFileAs, OpenFile, ImportCsv, ExportCsv, CopyCell, NewConnection, NewProject, OpenProject,
             CommandPalette, FocusEditor,
-            ToggleTheme
+            ToggleTheme, ToggleAssistant
         );
         root.child(
             TitleBar::new().child(
@@ -1743,9 +1749,11 @@ impl Render for Workbench {
                                 v_flex()
                                     .size_full()
                                     .child(self.render_tabs(cx))
-                                    .child(div().flex_1().when_some(active, |d, t| d.child(t))),
+                                    .child(div().flex_1().when_some(active.clone(), |d, t| d.child(t))),
                             ),
-                    ),
+                    ).when_some(active.filter(|_| self.assistant_open), |row, t| row.child(
+                        resizable_panel().size(px(350.)).size_range(px(260.)..px(650.))
+                            .child(t.read(cx).assistant.clone()))),
             ),
         )
         .child(self.render_status(cx))

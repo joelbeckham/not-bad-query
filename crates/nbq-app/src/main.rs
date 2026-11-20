@@ -2,6 +2,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod actions;
+mod assistant;
 mod app_icon;
 mod complete;
 mod conn_dialog;
