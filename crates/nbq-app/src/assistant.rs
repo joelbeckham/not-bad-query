@@ -1,8 +1,8 @@
-use std::{ops::Range, path::PathBuf, sync::Arc};
+use std::{path::PathBuf, sync::Arc};
 
 use crate::{complete::Catalogs, query_tab::QueryTab, ui::Projects};
 use gpui_kit::component::button::{Button, ButtonVariants};
-use gpui_kit::component::input::{EditorState, Input, InputEditsEvent, InputEvent, InputState};
+use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::{ActiveTheme, Disableable, Sizable, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
@@ -10,69 +10,6 @@ use nbq_engine::{
     Engine,
     assistant::{Reply, Request, Skill},
 };
-use std::{cell::RefCell, rc::Rc};
-
-#[derive(Clone)]
-struct Target {
-    sql: String,
-    range: Rc<RefCell<Option<Range<usize>>>>,
-    _edits: Rc<Subscription>,
-}
-
-impl Target {
-    fn track(
-        editor: &Entity<EditorState>,
-        selection: Range<usize>,
-        cx: &mut Context<Assistant>,
-    ) -> Self {
-        let sql = editor.read(cx).value()[selection.clone()].to_string();
-        let range = Rc::new(RefCell::new(Some(selection)));
-        let tracked = range.clone();
-        let sub = cx.subscribe(editor, move |_, _, event: &InputEditsEvent, _| {
-            for (edit, _) in event.edits() {
-                let mut slot = tracked.borrow_mut();
-                *slot = slot.take().and_then(|r| {
-                    shift_target(r, edit.start_byte..edit.old_end_byte, edit.new_end_byte)
-                });
-            }
-        });
-        Self {
-            sql,
-            range,
-            _edits: Rc::new(sub),
-        }
-    }
-    fn resolve(&self, current: &str) -> Option<Range<usize>> {
-        self.range
-            .borrow()
-            .clone()
-            .filter(|r| current.get(r.clone()) == Some(self.sql.as_str()))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::shift_target;
-
-    #[test]
-    fn editor_changes_move_or_invalidate_the_original_byte_range() {
-        assert_eq!(shift_target(10..18, 2..4, 10), Some(16..24));
-        assert_eq!(shift_target(10..18, 18..20, 19), Some(10..18));
-        assert_eq!(shift_target(10..18, 13..13, 15), None);
-        assert_eq!(shift_target(10..18, 0..20, 0), None);
-    }
-}
-
-fn shift_target(range: Range<usize>, edit: Range<usize>, new_end: usize) -> Option<Range<usize>> {
-    if edit.end <= range.start {
-        Some(range.start - edit.end + new_end..range.end - edit.end + new_end)
-    } else if edit.start >= range.end {
-        Some(range)
-    } else {
-        None
-    }
-}
-
 pub struct Assistant {
     tab: WeakEntity<QueryTab>,
     engine: Arc<Engine>,
@@ -85,8 +22,6 @@ pub struct Assistant {
     revision: usize,
     history: Vec<(String, String)>,
     notice: String,
-    last: Option<Target>,
-    pending_sql: Option<String>,
     skill: Option<(PathBuf, Skill, String)>,
     scroll: ScrollHandle,
     _enter: Subscription,
@@ -133,8 +68,6 @@ impl Assistant {
             revision: 0,
             history: vec![],
             notice: String::new(),
-            last: None,
-            pending_sql: None,
             skill: None,
             scroll: ScrollHandle::new(),
             _enter: enter,
@@ -150,15 +83,13 @@ impl Assistant {
         self.busy = false;
         self.history.clear();
         self.notice.clear();
-        self.last = None;
-        self.pending_sql = None;
         self.skill = None;
         cx.notify();
     }
 
     fn send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let prompt = self.input.read(cx).value().trim().to_string();
-        if prompt.is_empty() || self.busy || self.skill.is_some() || self.pending_sql.is_some() {
+        if prompt.is_empty() || self.busy || self.skill.is_some() {
             return;
         }
         let Some(tab) = self.tab.upgrade() else {
@@ -166,11 +97,8 @@ impl Assistant {
         };
         let editor = tab.read(cx).editor.clone();
         let selection = editor.read(cx).selected_range();
-        let target = if selection.is_empty() {
-            self.last.clone()
-        } else {
-            Some(Target::track(&editor, selection, cx))
-        };
+        let script = editor.read(cx).value().to_string();
+        let selected_sql = (!selection.is_empty()).then(|| script[selection].to_string());
         let tab = tab.read(cx);
         let conn = tab.conn.as_ref();
         let root = self
@@ -183,7 +111,8 @@ impl Assistant {
             database: conn
                 .map(|c| format!("{:?} / {} / {}", c.kind, c.name, c.database))
                 .unwrap_or_else(|| "No database selected".into()),
-            target: target.as_ref().map(|t| t.sql.clone()),
+            script,
+            selected_sql,
             prompt: prompt.clone(),
             history: self
                 .history
@@ -234,7 +163,7 @@ impl Assistant {
                 a.busy = false;
                 a.notice.clear();
                 match reply {
-                    Ok(reply) => a.receive(reply, target, root, window, cx),
+                    Ok(reply) => a.receive(reply, root, window, cx),
                     Err(e) => {
                         a.history.pop();
                         a.notice = e;
@@ -255,18 +184,13 @@ impl Assistant {
     fn receive(
         &mut self,
         reply: Reply,
-        target: Option<Target>,
         root: Option<PathBuf>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         self.history.push(("Assistant".into(), reply.message));
         if let Some(sql) = reply.sql.filter(|s| !s.trim().is_empty()) {
-            let target = target.filter(|_| !reply.new_query);
-            if !self.apply(&sql, target.as_ref(), window, cx) {
-                self.pending_sql = Some(sql);
-                self.notice="The original query changed. Select the SQL to replace, or insert the proposal at the end.".into();
-            }
+            self.append_sql(&sql, window, cx);
         }
         if let (Some(root), Some(skill)) = (root, reply.skill) {
             let diff = similar::TextDiff::from_lines(
@@ -280,37 +204,28 @@ impl Assistant {
         }
     }
 
-    fn apply(
-        &mut self,
-        sql: &str,
-        target: Option<&Target>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> bool {
+    fn append_sql(&self, sql: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Some(tab) = self.tab.upgrade() else {
-            return false;
+            return;
         };
         let editor = tab.read(cx).editor.clone();
-        let script = editor.read(cx).value().to_string();
-        let range = match target {
-            Some(t) => match t.resolve(&script) {
-                Some(range) => range,
-                None => return false,
-            },
-            None => script.len()..script.len(),
-        };
-        let prefix = if target.is_none() && !script.is_empty() && !script.ends_with('\n') {
-            "\n\n"
-        } else {
-            ""
-        };
-        let start = range.start + prefix.len();
+        let script = editor.read(cx).value();
+        let end = script.len();
+        let prefix =
+            if script.is_empty() || script.ends_with("\n\n") || script.ends_with("\r\n\r\n") {
+                ""
+            } else if script.ends_with('\n') {
+                "\n"
+            } else {
+                "\n\n"
+            };
+        let start = end + prefix.len();
         let selection = start..start + sql.len();
         let focus = self.input.focus_handle(cx).is_focused(window);
         editor.update(cx, |e, cx| {
-            e.set_selected_range(range, cx);
+            e.set_selected_range(end..end, cx);
             e.replace(format!("{prefix}{sql}"), window, cx);
-            e.set_selected_range(selection.clone(), cx);
+            e.set_selected_range(selection, cx);
             if focus {
                 e.focus(window, cx);
             }
@@ -319,8 +234,6 @@ impl Assistant {
             t.dirty = true;
             cx.notify();
         });
-        self.last = Some(Target::track(&editor, selection, cx));
-        true
     }
 
     fn save_key(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -400,12 +313,9 @@ impl Render for Assistant {
             .gap_3();
         if self.history.is_empty() {
             chat = chat
-                .child(
-                    div()
-                        .text_sm()
-                        .text_color(theme.muted_foreground)
-                        .child("Select SQL to explain or revise it, or start a new query."),
-                )
+                .child(div().text_sm().text_color(theme.muted_foreground).child(
+                    "Highlight SQL to refer to it. New queries are added at the end of this tab.",
+                ))
                 .child(
                     h_flex().gap_2().flex_wrap().children(
                         [
@@ -443,41 +353,6 @@ impl Render for Assistant {
                             .child(role.clone()),
                     )
                     .child(div().text_sm().child(msg.clone())),
-            );
-        }
-        if let Some(sql) = self.pending_sql.clone() {
-            chat = chat.child(div().text_sm().child(sql)).child(
-                h_flex()
-                    .gap_2()
-                    .child(
-                        Button::new("apply-sql")
-                            .small()
-                            .label("Apply to editor")
-                            .on_click(cx.listener(|a, _, w, cx| {
-                                if let Some(sql) = a.pending_sql.take() {
-                                    let target = a.tab.upgrade().and_then(|t| {
-                                        let editor = t.read(cx).editor.clone();
-                                        let range = editor.read(cx).selected_range();
-                                        (!range.is_empty())
-                                            .then(|| Target::track(&editor, range, cx))
-                                    });
-                                    a.apply(&sql, target.as_ref(), w, cx);
-                                    a.notice.clear();
-                                    cx.notify();
-                                }
-                            })),
-                    )
-                    .child(
-                        Button::new("discard-sql")
-                            .ghost()
-                            .small()
-                            .label("Dismiss")
-                            .on_click(cx.listener(|a, _, _, cx| {
-                                a.pending_sql = None;
-                                a.notice.clear();
-                                cx.notify();
-                            })),
-                    ),
             );
         }
         if let Some((_, skill, diff)) = &self.skill {
@@ -594,8 +469,7 @@ impl Render for Assistant {
                                     .disabled(
                                         self.input.read(cx).value().trim().is_empty()
                                             || self.busy
-                                            || self.skill.is_some()
-                                            || self.pending_sql.is_some(),
+                                            || self.skill.is_some(),
                                     )
                                     .on_click(cx.listener(|a, _, w, cx| a.send(w, cx))),
                             ),

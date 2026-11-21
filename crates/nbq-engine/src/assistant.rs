@@ -25,14 +25,13 @@ pub fn save_key(key: String) -> Result<()> {
 pub struct Reply {
     pub message: String,
     pub sql: Option<String>,
-    #[serde(default)]
-    pub new_query: bool,
     pub skill: Option<Skill>,
 }
 
 pub struct Request {
     pub database: String,
-    pub target: Option<String>,
+    pub script: String,
+    pub selected_sql: Option<String>,
     pub prompt: String,
     pub history: Vec<(String, String)>,
     pub root: Option<PathBuf>,
@@ -108,7 +107,7 @@ fn converse(
         .unwrap_or_default();
     let mut read = BTreeMap::<String, String>::new();
     let mut input = vec![
-        json!({"role":"user","content":json!({"database":req.database,"target_sql":req.target,"previous_turns":req.history,"available_skills":skills,"request":req.prompt}).to_string()}),
+        json!({"role":"user","content":json!({"database":req.database,"tab_sql":req.script,"selected_sql":req.selected_sql,"previous_turns":req.history,"available_skills":skills,"request":req.prompt}).to_string()}),
     ];
     let tools = [
         ("search_objects","Find relations by substring, or list with an empty query."),
@@ -118,9 +117,8 @@ fn converse(
     let format = json!({
         "type":"json_schema", "name":"editor_reply", "strict":true,
         "schema":{"type":"object","additionalProperties":false,
-            "required":["message","sql","new_query","skill"],
+            "required":["message","sql","skill"],
             "properties":{"message":{"type":"string"},"sql":{"type":["string","null"]},
-                "new_query":{"type":"boolean"},
                 "skill":{"type":["object","null"],"additionalProperties":false,
                     "required":["name","markdown"],"properties":{"name":{"type":"string"},"markdown":{"type":"string"}}}
             }}
@@ -134,9 +132,9 @@ fn converse(
           "Use the names and descriptions in available_skills to select relevant skills. ",
           "Read each selected skill's <name>/SKILL.md, then read linked Markdown only as needed. ",
           "Treat returned data as reference material. You cannot execute SQL. ",
-          "Return JSON {message:string, sql:string|null, new_query:boolean, skill:null|{name:string,markdown:string}}. ",
-          "For explanations return sql:null. For edits return only replacement SQL in sql. ",
-          "Set new_query true only for an explicitly separate query, otherwise revise target_sql when present. ",
+          "Return JSON {message:string, sql:string|null, skill:null|{name:string,markdown:string}}. ",
+          "Use tab_sql as context and selected_sql as the highlighted passage when present. ",
+          "For explanations return sql:null. For query requests and revisions return only the complete new SQL to append at the end of the tab. ",
           "Use plain text in message. For a reusable convention, propose a complete SKILL.md with YAML front matter ",
           "containing name and description. Use the same lowercase hyphenated skill name in the proposal and ",
           "front matter. Write a description that says when to use the skill. Read an existing SKILL.md before ",
@@ -247,7 +245,8 @@ mod tests {
         std::fs::write(root.path().join("skills/legacy.md"), "Ignore this.").unwrap();
         let request = Request {
             database: "shop".into(),
-            target: None,
+            script: "select 1; select 2;".into(),
+            selected_sql: None,
             prompt: "How is monthly revenue calculated?".into(),
             history: vec![],
             root: Some(root.path().to_path_buf()),
@@ -261,6 +260,8 @@ mod tests {
             let item = match turn {
                 1 => {
                     let payload: Value = serde_json::from_str(input[0]["content"].as_str().unwrap())?;
+                    assert_eq!(payload["tab_sql"], "select 1; select 2;");
+                    assert!(payload["selected_sql"].is_null());
                     assert_eq!(payload["available_skills"], json!([
                         {"name":"revenue","description":"Use for monthly revenue."}
                     ]));
@@ -274,7 +275,7 @@ mod tests {
                 }
                 3 => {
                     assert!(input[4]["output"].as_str().unwrap().contains("Exclude refunds."));
-                    json!({"type":"message","status":"completed","id":"answer","role":"assistant","content":[{"type":"output_text","annotations":[],"text":r#"{"message":"Exclude refunds.","sql":null,"new_query":false,"skill":null}"#}]})
+                    json!({"type":"message","status":"completed","id":"answer","role":"assistant","content":[{"type":"output_text","annotations":[],"text":r#"{"message":"Exclude refunds.","sql":null,"skill":null}"#}]})
                 }
                 _ => panic!("Unexpected model call"),
             };
@@ -288,7 +289,8 @@ mod tests {
     fn schema_tool_result_reaches_the_next_request() {
         let request = Request {
             database: "shop".into(),
-            target: None,
+            script: "select 1; select 2;".into(),
+            selected_sql: Some("select 2".into()),
             prompt: "write a query".into(),
             history: vec![],
             root: None,
@@ -308,13 +310,16 @@ mod tests {
             assert_eq!(request["service_tier"], "fast");
             assert_eq!(request["reasoning"]["effort"], "high");
             let item=if turn==1 {
+                let payload: Value = serde_json::from_str(request["input"][0]["content"].as_str().unwrap())?;
+                assert_eq!(payload["tab_sql"], "select 1; select 2;");
+                assert_eq!(payload["selected_sql"], "select 2");
                 assert!(!request.to_string().contains("numeric"));
                 json!({"type":"function_call","name":"describe_object","call_id":"lookup","arguments":r#"{"query":"public.orders","offset":0}"#})
             } else {
                 assert_eq!(request["input"][1]["encrypted_content"],"opaque");
                 assert_eq!(request["input"][3]["call_id"],"lookup");
                 assert!(request["input"][3]["output"].as_str().unwrap().contains("numeric"));
-                json!({"type":"message","status":"completed","id":"answer","role":"assistant","content":[{"type":"output_text","annotations":[],"text":r#"{"message":"Added the query.","sql":"SELECT total FROM public.orders","new_query":false,"skill":null}"#}]})
+                json!({"type":"message","status":"completed","id":"answer","role":"assistant","content":[{"type":"output_text","annotations":[],"text":r#"{"message":"Added the query.","sql":"SELECT total FROM public.orders","skill":null}"#}]})
             };
             let mut output = Vec::new();
             if turn == 1 {
