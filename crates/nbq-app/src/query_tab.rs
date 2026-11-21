@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::input::{Editor, EditorState, InputEvent};
+use gpui_kit::component::input::{Copy, Cut, Editor, EditorState, InputEvent, RopeExt as _};
 use gpui_kit::component::link::Link;
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
@@ -150,6 +150,51 @@ impl QueryTab {
 
     pub fn is_running(&self) -> bool {
         self.running.is_some()
+    }
+
+    fn clipboard_line(&mut self, cut: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let editor = self.editor.read(cx);
+        if !editor.focus_handle(cx).is_focused(window) || editor.is_copyable() {
+            return;
+        }
+        if cut && !editor.is_editable() {
+            return;
+        }
+
+        let text = editor.text();
+        if text.len() == 0 {
+            return;
+        }
+        let row = text.offset_to_point(editor.cursor()).row;
+        let start = text.line_start_offset(row);
+        let end = text.line_start_offset(row + 1);
+        let mut line = text.slice(start..end).to_string();
+        let mut cut_start = start;
+        if row + 1 == text.lines_len() {
+            // The final line has no trailing newline. Move the preceding break
+            // to the clipboard after the line, so cutting leaves no empty row.
+            if row == 0 {
+                line.push('\n');
+            } else {
+                let newline = if start >= 2 && text.byte(start - 2) == b'\r' {
+                    "\r\n"
+                } else {
+                    "\n"
+                };
+                cut_start -= newline.len();
+                line.push_str(newline);
+            }
+        }
+
+        cx.write_to_clipboard(ClipboardItem::new_string(line));
+        if cut {
+            self.editor.update(cx, |editor, cx| {
+                let text = editor.text();
+                let range = text.offset_to_offset_utf16(cut_start)..text.offset_to_offset_utf16(end);
+                editor.replace_text_in_range(Some(range), "", window, cx);
+            });
+        }
+        cx.stop_propagation();
     }
 
     pub fn set_connection(&mut self, conn: Option<Connection>, cx: &mut Context<Self>) {
@@ -795,6 +840,12 @@ impl Render for QueryTab {
                                 .child(
                                     div()
                                         .key_context("SqlEditor")
+                                        .capture_action(cx.listener(|this, _: &Copy, window, cx| {
+                                            this.clipboard_line(false, window, cx);
+                                        }))
+                                        .capture_action(cx.listener(|this, _: &Cut, window, cx| {
+                                            this.clipboard_line(true, window, cx);
+                                        }))
                                         .size_full()
                                         .child(Editor::new(&self.editor).bordered(false).h(relative(1.))),
                                 )
