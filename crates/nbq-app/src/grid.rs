@@ -321,11 +321,12 @@ impl TableDelegate for ResultGrid {
 
     fn render_th(&mut self, ix: usize, _: &mut Window, cx: &mut Context<TableState<Self>>) -> impl IntoElement {
         let c = &self.cols[ix];
+        let theme = cx.theme();
         h_flex()
             .gap_1p5()
             .overflow_hidden()
-            .child(div().font_weight(FontWeight::SEMIBOLD).child(c.name.clone()))
-            .child(div().text_xs().text_color(cx.theme().muted_foreground).child(c.db_type.clone()))
+            .child(div().font_weight(FontWeight::SEMIBOLD).text_color(theme.foreground).child(c.name.clone()))
+            .child(div().text_xs().text_color(theme.muted_foreground).child(c.db_type.clone()))
     }
 
     fn render_td(
