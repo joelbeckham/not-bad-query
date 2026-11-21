@@ -625,11 +625,12 @@ impl QueryTab {
             .when_some(running, |el, d| {
                 el.child(
                     h_flex()
+                        .id("query-toolbar-progress")
                         .gap_1()
                         .text_sm()
                         .text_color(theme.warning)
-                        .child(Icon::new(IconName::LoaderCircle).small())
-                        .child(fmt_elapsed(d)),
+                        .child(Spinner::new().icon(IconName::LoaderCircle).small().color(theme.warning).ease(|t| t))
+                        .child(div().min_w(px(48.)).text_right().child(fmt_elapsed(d))),
                 )
             })
             .child(if self.running.is_some() {
@@ -659,7 +660,11 @@ impl QueryTab {
             Status::Running => {
                 left = left
                     .text_color(theme.warning)
-                    .child(Icon::new(IconName::LoaderCircle).small())
+                    .child(
+                        div().id("query-result-progress").child(
+                            Spinner::new().icon(IconName::LoaderCircle).small().color(theme.warning).ease(|t| t),
+                        ),
+                    )
                     .child("Running…");
             }
             Status::Rows { elapsed } => {

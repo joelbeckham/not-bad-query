@@ -16,6 +16,7 @@ use gpui_kit::component::dialog::{DialogAction, DialogClose, DialogEntrance, Dia
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::menu::ContextMenuExt as _;
 use gpui_kit::component::resizable::{h_resizable, resizable_panel};
+use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::status_bar::StatusBar;
 use gpui_kit::component::tab::{Tab, TabBar};
 use gpui_kit::component::tooltip::Tooltip;
@@ -1518,13 +1519,15 @@ impl Workbench {
                 let t = t.read(cx);
                 let color = t.conn.as_ref().map(|c| conn_color(c, cx)).unwrap_or(theme.muted_foreground.opacity(0.5));
                 let indicator = if t.is_running() {
-                    Icon::new(IconName::LoaderCircle).xsmall().text_color(theme.warning).into_any_element()
+                    div().id(("running-query-tab", t.engine_tab.0)).child(
+                        Spinner::new().icon(IconName::LoaderCircle).xsmall().color(theme.warning).ease(|t| t),
+                    ).into_any_element()
                 } else {
                     div().size(px(8.)).rounded_full().bg(color).into_any_element()
                 };
                 let pending = t.txn.in_txn && t.txn.pending_writes > 0;
                 Tab::new()
-                    .prefix(h_flex().pl_2().child(indicator))
+                    .prefix(h_flex().pl_2().child(h_flex().w_3().justify_center().child(indicator)))
                     .child(
                         h_flex()
                             .gap_1()
