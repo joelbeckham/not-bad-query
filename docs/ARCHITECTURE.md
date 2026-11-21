@@ -304,7 +304,7 @@ exports/                           CSV export default (git-ignored)
 - `Project` keys (`u32`) are per process, and `Connection::key()` is `<project key>:<id>`. Engine
   caches, catalogs and tree ids use that key, so two copies of a project never collide.
 - A `notify` watcher records changed paths; the workbench polls it, reloads projects whose
-  `connections/` or `scripts/` changed, and reconnects tabs whose connection settings changed.
+  `connections/`, `scripts/`, or `skills/` changed, and reconnects tabs whose connection settings changed.
 
 ## SQL assistant skills
 
@@ -316,6 +316,10 @@ Markdown using paths relative to the skill folder, such as
 `[Revenue rules](references/revenue.md)`. The assistant reads linked files on
 demand, up to 64 KiB per file. Accepting a proposed change writes the reviewed
 `SKILL.md`.
+
+The sidebar shows a Skills section with skill folders and Markdown references.
+File changes refresh it automatically; double-click opens Markdown in the system's
+default application.
 
 ## Testing
 

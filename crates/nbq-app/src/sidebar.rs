@@ -1,5 +1,5 @@
 //! Left sidebar: one tree of open projects. Each project has its
-//! connections (with lazily-loaded database objects) and its scripts.
+//! connections (with lazily-loaded database objects), scripts, and assistant skills.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -57,6 +57,9 @@ enum Node {
     VpnBlocked,
     ScriptDir { project: u32, dir: PathBuf },
     Script(PathBuf),
+    Skills,
+    SkillDir(PathBuf),
+    SkillFile(PathBuf),
 }
 
 #[derive(Clone)]
@@ -132,6 +135,7 @@ pub struct Sidebar {
     tree: Entity<TreeState>,
     /// Scanned scripts per project (rescanned on `refresh`).
     scripts: HashMap<u32, Vec<ScriptEntry>>,
+    skills: HashMap<u32, Vec<ScriptEntry>>,
     /// Display info per tree item id, rebuilt with the items.
     nodes: Rc<HashMap<SharedString, Node>>,
     loaded: HashMap<Key, Result<Vec<ObjItem>, String>>,
@@ -181,6 +185,7 @@ impl Sidebar {
             recent,
             tree,
             scripts: HashMap::new(),
+            skills: HashMap::new(),
             nodes: Rc::new(HashMap::new()),
             loaded: HashMap::new(),
             loading: HashSet::new(),
@@ -197,10 +202,11 @@ impl Sidebar {
         s
     }
 
-    /// Projects or their files changed: rescan scripts and rebuild.
+    /// Projects or their files changed: rescan scripts and skills and rebuild.
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
         let ps = self.projects.borrow();
         self.scripts = ps.iter().map(|p| (p.key, scan_scripts(&p.scripts_dir(), 0))).collect();
+        self.skills = ps.iter().map(|p| (p.key, scan_files(&p.root.join("skills"), 0, &["md"]))).collect();
         // Forget cached objects of connections that are gone.
         let keys: HashSet<String> =
             ps.iter().flat_map(|p| p.connections.connections.iter().map(|c| c.key())).collect();
@@ -352,6 +358,7 @@ impl Sidebar {
                 self.expanded.insert(project_id(p.key));
                 self.expanded.insert(section_id(p.key, false));
                 self.expanded.insert(section_id(p.key, true));
+                self.expanded.insert(SharedString::from(format!("pk:{}", p.key)));
             }
         }
         let items: Vec<TreeItem> = ps.iter().map(|p| self.project_item(p, &mut nodes)).collect();
@@ -389,9 +396,13 @@ impl Sidebar {
         nodes.insert(scripts_id.clone(), Node::Section { project: p.key, scripts: true });
         let root = build_tree(&p.connections);
         let scripts = self.scripts.get(&p.key).map(|s| script_items(p.key, s, nodes)).unwrap_or_default();
+        let skills_id: SharedString = format!("pk:{}", p.key).into();
+        nodes.insert(skills_id.clone(), Node::Skills);
+        let skills = self.skills.get(&p.key).map(|s| skill_items(s, nodes)).unwrap_or_default();
         TreeItem::new(id, p.name().to_string()).children(vec![
             TreeItem::new(conns_id, "Connections").children(self.folder_items(p.key, &root, nodes)),
             TreeItem::new(scripts_id, "Scripts").children(scripts),
+            TreeItem::new(skills_id, "Skills").children(skills),
         ])
     }
 
@@ -450,6 +461,7 @@ impl Sidebar {
         match self.nodes.get(id).cloned() {
             Some(Node::Conn { key, .. }) => cx.emit(SidebarEvent::OpenConnection(key)),
             Some(Node::Script(p)) => cx.emit(SidebarEvent::OpenScript(p)),
+            Some(Node::SkillFile(p)) => cx.open_with_system(&p),
             Some(Node::Obj { conn, path: Some(ObjPath::Object { schema, name, .. }), .. }) => {
                 cx.emit(SidebarEvent::SelectFrom { conn, schema, name })
             }
@@ -471,7 +483,9 @@ impl Sidebar {
             Some(Node::Project(_)) => (Icon::new(Lucide::Briefcase), None, Some(theme.primary), true),
             Some(Node::Section { scripts: false, .. }) => (Icon::new(Lucide::Cable), None, Some(muted), false),
             Some(Node::Section { scripts: true, .. }) => (Icon::new(Lucide::FileCode), None, Some(muted), false),
-            Some(Node::Folder { .. }) | Some(Node::ScriptDir { .. }) => {
+            Some(Node::Skills) => (Icon::new(Lucide::BookOpen), None, Some(muted), false),
+            Some(Node::SkillFile(_)) => (Icon::new(Lucide::FileText), None, Some(muted), false),
+            Some(Node::Folder { .. }) | Some(Node::ScriptDir { .. }) | Some(Node::SkillDir(_)) => {
                 (Icon::new(if folder == Some(true) { IconName::FolderOpen } else { IconName::Folder }), None, Some(muted), false)
             }
             Some(Node::Conn { color, .. }) => {
@@ -509,7 +523,7 @@ impl Sidebar {
             Some(Node::Script(_)) => (Icon::new(Lucide::FileCode), None, Some(theme.green), false),
             None => (Icon::new(IconName::File), None, None, false),
         };
-        let section = matches!(node, Some(Node::Section { .. }));
+        let section = matches!(node, Some(Node::Section { .. }) | Some(Node::Skills));
         // Keep indentation and icons rigid when the panel narrows. Only the
         // text may yield; shrinking these slots offsets every row differently.
         let chevron = div().w(px(12.)).h(px(12.)).flex_shrink_0().when_some(folder, |el, open| {
@@ -621,6 +635,12 @@ impl Sidebar {
         };
         let folder_item = |dir: PathBuf| item("New folder...", IconName::Folder).on_click(emit(Rc::new(move || SidebarEvent::NewFolder(dir.clone()))));
         match node {
+            Some(Node::SkillDir(path)) => menu.item(reveal_item(path)),
+            Some(Node::SkillFile(path)) => {
+                let parent = path.parent().unwrap_or(&path).to_path_buf();
+                menu.item(item("Open in default app", IconName::File).on_click(move |_, _, cx| cx.open_with_system(&path)))
+                    .item(reveal_item(parent))
+            }
             Some(Node::Project(p)) => {
                 let root = root_of(p).unwrap_or_default();
                 let scripts = root.join(nbq_core::project::SCRIPTS_DIR);
@@ -784,6 +804,10 @@ fn find(t: &TreeState, id: &SharedString) -> Option<TreeItem> {
 
 /// A scripts folder, folders first. Depth-limited for safety.
 fn scan_scripts(dir: &Path, depth: usize) -> Vec<ScriptEntry> {
+    scan_files(dir, depth, &["sql", "csv"])
+}
+
+fn scan_files(dir: &Path, depth: usize, extensions: &[&str]) -> Vec<ScriptEntry> {
     if depth > 12 {
         return Vec::new();
     }
@@ -798,7 +822,7 @@ fn scan_scripts(dir: &Path, depth: usize) -> Vec<ScriptEntry> {
         }
         if p.is_dir() {
             dirs.push((name, p));
-        } else if p.extension().is_some_and(|x| x.eq_ignore_ascii_case("sql") || x.eq_ignore_ascii_case("csv")) {
+        } else if p.extension().is_some_and(|x| extensions.iter().any(|ext| x.eq_ignore_ascii_case(ext))) {
             files.push((name, p));
         }
     }
@@ -806,10 +830,23 @@ fn scan_scripts(dir: &Path, depth: usize) -> Vec<ScriptEntry> {
     files.sort_by_key(|f| f.0.to_lowercase());
     let mut out: Vec<ScriptEntry> = dirs
         .into_iter()
-        .map(|(name, p)| ScriptEntry { children: Some(scan_scripts(&p, depth + 1)), name, path: p })
+        .map(|(name, p)| ScriptEntry { children: Some(scan_files(&p, depth + 1, extensions)), name, path: p })
         .collect();
     out.extend(files.into_iter().map(|(name, path)| ScriptEntry { name, path, children: None }));
     out
+}
+
+fn skill_items(entries: &[ScriptEntry], nodes: &mut HashMap<SharedString, Node>) -> Vec<TreeItem> {
+    entries.iter().map(|e| {
+        let id: SharedString = format!("sk:{}", e.path.display()).into();
+        if let Some(children) = &e.children {
+            nodes.insert(id.clone(), Node::SkillDir(e.path.clone()));
+            TreeItem::new(id, e.name.clone()).children(skill_items(children, nodes))
+        } else {
+            nodes.insert(id.clone(), Node::SkillFile(e.path.clone()));
+            TreeItem::new(id, e.name.clone())
+        }
+    }).collect()
 }
 
 fn script_items(project: u32, entries: &[ScriptEntry], nodes: &mut HashMap<SharedString, Node>) -> Vec<TreeItem> {
@@ -888,6 +925,9 @@ impl Render for Sidebar {
                 let target = location.filter(|(_, _, folder)| *folder);
                 let move_view = v.clone();
                 let content = div().id(("tree-row", ix)).w_full()
+                    .when(matches!(n.get(&id), Some(Node::SkillFile(_))), |row| {
+                        row.tooltip(|window, cx| Tooltip::new("Double-click to open in default app").build(window, cx))
+                    })
                     .when_some(source, |row, drag| row.on_drag(drag, |drag, _, _, cx| cx.new(|_| drag.clone())))
                     .when_some(target, |row, (dir, root, _)| {
                         let highlight_dir = dir.clone();
@@ -937,6 +977,26 @@ mod tests {
     use std::collections::HashMap;
     use nbq_engine::meta::ObjPath;
     use nbq_engine::ConnState;
+
+    #[test]
+    fn skill_scan_reflects_created_and_removed_markdown() {
+        let root = tempfile::tempdir().unwrap();
+        let skills = root.path().join("skills");
+        assert!(super::scan_files(&skills, 0, &["md"]).is_empty());
+        let folder = skills.join("revenue");
+        std::fs::create_dir_all(folder.join("references")).unwrap();
+        std::fs::write(folder.join("SKILL.md"), "Revenue rules").unwrap();
+        std::fs::write(folder.join("references/rules.md"), "Rules").unwrap();
+        std::fs::write(folder.join("ignored.sql"), "select 1").unwrap();
+        let entries = super::scan_files(&skills, 0, &["md"]);
+        let children = entries[0].children.as_ref().unwrap();
+        assert_eq!(children.len(), 2);
+        assert_eq!(children[1].name, "SKILL.md");
+        assert_eq!(children[0].children.as_ref().unwrap()[0].name, "rules.md");
+        std::fs::remove_file(folder.join("SKILL.md")).unwrap();
+        let entries = super::scan_files(&skills, 0, &["md"]);
+        assert_eq!(entries[0].children.as_ref().unwrap().len(), 1);
+    }
 
     #[test]
     fn profile_state_includes_all_sessions_and_preserves_failures() {

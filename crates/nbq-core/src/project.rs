@@ -353,7 +353,7 @@ impl Project {
     pub fn is_relevant_change(&self, path: &Path) -> bool {
         let Ok(rel) = path.strip_prefix(&self.root) else { return false };
         match rel.components().next().map(|c| c.as_os_str().to_string_lossy().to_string()) {
-            Some(first) => first == CONNECTIONS_DIR || first == SCRIPTS_DIR || first == MARKER,
+            Some(first) => first == CONNECTIONS_DIR || first == SCRIPTS_DIR || first == "skills" || first == MARKER,
             None => false,
         }
     }
@@ -556,6 +556,9 @@ mod tests {
         let p = Project::create(d.path(), "A").unwrap();
         assert!(p.is_relevant_change(&d.path().join("connections/x.toml")));
         assert!(p.is_relevant_change(&d.path().join("scripts/a/b.sql")));
+        assert!(p.is_relevant_change(&d.path().join("skills")));
+        assert!(p.is_relevant_change(&d.path().join("skills/revenue/SKILL.md")));
+        assert!(p.is_relevant_change(&d.path().join("skills/revenue/references/rules.md")));
         assert!(!p.is_relevant_change(&d.path().join("exports/big.csv")));
         assert!(!p.is_relevant_change(&d.path().join(".not-bad-query/local.toml")));
     }
