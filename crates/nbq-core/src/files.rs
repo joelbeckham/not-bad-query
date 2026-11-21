@@ -42,7 +42,7 @@ pub(crate) fn write_atomic(path: &Path, text: &str, expected: Option<&str>, repl
     for attempt in 0..=20 {
         if let Some(expected) = expected {
             if read_script(path)? != expected {
-                return Err(io::Error::other("This script changed on disk. Reopen it or use Save As."));
+                return Err(io::Error::other("This script changed on disk."));
             }
         }
         let result = if replace || expected.is_some() { temp.persist(path) } else { temp.persist_noclobber(path) };

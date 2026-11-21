@@ -114,8 +114,7 @@ its implicit statement transaction until completion or cancellation.
   it instead of cancelling.
 * The tab shows pending writes and transaction age (`Event::Txn`).
 * The UI requires a query to finish and an open transaction to be resolved before
-  changing connections or commit mode. Closing a window with unsaved scripts or
-  pending work asks before discarding it. Closing a tab cancels execution before
+  changing connections or commit mode. Closing a tab cancels execution before
   its session actor shuts down and rolls back.
 * Open transactions expire after **15 minutes without database activity**.
   Configure `transaction_idle_timeout_secs = 900` in the app's `settings.toml`
@@ -139,9 +138,11 @@ its implicit statement transaction until completion or cancellation.
   cannot keep an idle transaction alive. Fatal timeout SQLSTATEs `25P03` / `25P04`
   invalidate the session. Reconnection does not replay discarded writes.
 * Disconnect with pending work asks for **Disconnect and roll back**, then stops
-  execution and releases all sessions for that profile. Confirmed window close
-  waits for engine cleanup, including already-closing tabs and metadata sessions,
-  before removing the window. Per-session cancellation/socket deadlines prevent
+  execution and releases all sessions for that profile. Window close saves edited
+  scripts that have a file, discards untitled tabs, and then cancels queries and
+  rolls back open transactions. It waits for engine cleanup, including
+  already-closing tabs and metadata sessions, before removing the window.
+  Per-session cancellation/socket deadlines prevent
   a broken connection from hanging shutdown. Each PostgreSQL session owns its
   socket task, so a retained result stream cannot keep its transaction alive after
   session drop. PostgreSQL itself rolls back any open transaction when a session
@@ -267,7 +268,9 @@ Script reads and saves run on a background executor, with an 8 MiB script limit.
 An editor retains the opened/saved text revision. Saving rechecks that revision
 before atomic replacement, including each Windows sharing-violation retry. Save As
 creates a new file without clobbering an existing destination. Edits made during a
-save remain dirty after the saved snapshot is published.
+save remain dirty after the saved snapshot is published. Window close waits for
+in-progress saves, then writes any newer edits to file-backed scripts. If a save
+fails, the window stays open with the unsaved editor text and the save error.
 
 ## Cancel
 

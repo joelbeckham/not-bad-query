@@ -13,7 +13,7 @@ use gpui_kit::component::Disableable as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::command::{Command, CommandItem, CommandState};
 use gpui_kit::component::dialog::{DialogAction, DialogClose, DialogEntrance, DialogFooter};
-use gpui_kit::component::notification::Notification;
+use gpui_kit::component::notification::{Notification, NotificationType};
 use gpui_kit::component::menu::ContextMenuExt as _;
 use gpui_kit::component::resizable::{h_resizable, resizable_panel};
 use gpui_kit::component::spinner::Spinner;
@@ -52,10 +52,9 @@ pub struct Workbench {
     next_untitled: usize,
     /// A close that needs confirming (second Ctrl+W).
     close_armed: Option<EntityId>,
-    quit_dialog_open: bool,
     vpn_status: Option<VpnStatus>,
     vpn_prompt_open: bool,
-    closing: bool,
+    close_state: WindowClose,
     csv_queue: VecDeque<PathBuf>,
     csv_target: Option<PathBuf>,
     palette: Entity<CommandState>,
@@ -63,6 +62,22 @@ pub struct Workbench {
     _tasks: Vec<Task<()>>,
     _subs: Vec<Subscription>,
 }
+
+#[derive(PartialEq, Eq)]
+enum WindowClose {
+    Open,
+    Saving,
+    Disconnecting,
+}
+
+struct ScriptSave {
+    tab: Entity<QueryTab>,
+    path: PathBuf,
+    text: String,
+    expected: Option<String>,
+}
+
+struct CloseSaveFailure;
 
 struct UnavailableProject {
     root: PathBuf,
@@ -180,6 +195,7 @@ impl Workbench {
         }).detach();
     }
     fn show_csv(&mut self, key: u32, recipe: nbq_driver::csv_import::Recipe, window: &mut Window, cx: &mut Context<Self>) {
+        if self.close_state != WindowClose::Open { return; }
         let conn = self.projects.borrow().iter().find(|p| p.key == key).and_then(|p| p.connections.connections.iter().find(|c| c.params(None).file_path == recipe.database).cloned());
         let Some(conn) = conn else { error(window, cx, "The imported database is missing"); return; };
         self.sidebar.update(cx, |s, cx| { s.refresh_connection(&conn.key(), cx); s.show_table(&conn, &recipe.table, cx); });
@@ -285,10 +301,9 @@ impl Workbench {
             catalogs: Rc::new(RefCell::new(HashMap::new())),
             next_untitled: 1,
             close_armed: None,
-            quit_dialog_open: false,
             vpn_status: None,
             vpn_prompt_open: false,
-            closing: false,
+            close_state: WindowClose::Open,
             csv_queue: Default::default(),
             csv_target: None,
             palette,
@@ -323,45 +338,39 @@ impl Workbench {
     }
 
     fn request_close(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        if self.closing { return false; }
-        if self.tabs.iter().any(|tab| tab.read(cx).saving) {
-            error(window, cx, "Wait for the script save to finish before closing.");
+        if self.close_state != WindowClose::Open {
             return false;
         }
-        if !self.tabs.iter().any(|tab| { let (dirty, pending) = self.tab_risk(tab, cx); dirty || pending }) {
-            self.begin_shutdown(window, cx);
-            return false;
-        }
-        if self.quit_dialog_open { return false; }
-        self.quit_dialog_open = true;
-        let owner = cx.weak_entity();
-        window.open_dialog(cx, move |dialog, _, _| {
-            let (ok, cancel) = (owner.clone(), owner.clone());
-            dialog.title("Quit not-bad-query?")
-                .child("Unsaved scripts will be discarded. Running queries will stop and open transactions will roll back.")
-                .footer(DialogFooter::new()
-                    .child(DialogClose::new().child(Button::new("keep-working").outline().label("Keep working")))
-                    .child(DialogAction::new().child(Button::new("quit").primary().label("Quit"))))
-                .on_cancel(move |_, _, cx| { let _ = cancel.update(cx, |wb, _| wb.quit_dialog_open = false); true })
-                .on_ok(move |_, window, cx| {
-                    let _ = ok.update(cx, |wb, cx| {
-                        // A save may have started while the dialog was open.
-                        if wb.tabs.iter().any(|tab| tab.read(cx).saving) {
-                            wb.quit_dialog_open = false;
-                            error(window, cx, "Wait for the script save to finish before closing.");
-                            return;
-                        }
-                        wb.begin_shutdown(window, cx);
-                    });
-                    true
-                })
-        });
+        self.close_state = WindowClose::Saving;
+        window.remove_notification::<CloseSaveFailure>(cx);
+        self.focus.focus(window, cx);
+        self.advance_close(window, cx);
+        cx.notify();
         false
     }
 
-    fn begin_shutdown(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.closing { return; }
-        self.closing = true;
+    fn advance_close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.close_state != WindowClose::Saving || self.tabs.iter().any(|tab| tab.read(cx).saving) {
+            return;
+        }
+
+        let saves: Vec<_> = self.tabs.iter().filter_map(|tab| {
+            let state = tab.read(cx);
+            let path = state.path.as_ref().filter(|_| state.dirty)?;
+            let text = state.text(cx);
+            (state.saved_text.as_ref() != Some(&text)).then(|| ScriptSave {
+                tab: tab.clone(),
+                path: path.clone(),
+                text,
+                expected: state.saved_text.clone(),
+            })
+        }).collect();
+        if !saves.is_empty() {
+            self.write_scripts(saves, window, cx);
+            return;
+        }
+
+        self.close_state = WindowClose::Disconnecting;
         let done = self.engine.shutdown();
         cx.spawn_in(window, async move |this, cx| {
             let _ = done.await;
@@ -422,6 +431,7 @@ impl Workbench {
     }
 
     fn close_tab(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if self.close_state != WindowClose::Open { return; }
         let Some(tab) = self.tabs.get(ix).cloned() else { return };
         if tab.read(cx).saving {
             error(window, cx, "Wait for the script save to finish before closing.");
@@ -462,7 +472,7 @@ impl Workbench {
     }
 
     fn on_event(&mut self, ev: Event, window: &mut Window, cx: &mut Context<Self>) {
-        if self.closing { return; }
+        if self.close_state == WindowClose::Disconnecting { return; }
         match ev {
             Event::MetadataConn { conn, state } => {
                 if crate::vpn::blocked(&state) && !self.sidebar.read(cx).is_disconnected(&conn) {
@@ -509,7 +519,7 @@ impl Workbench {
     }
 
     fn prompt_vpn(&mut self, profile: Option<Connection>, window: &mut Window, cx: &mut Context<Self>) {
-        if self.vpn_prompt_open || self.closing {
+        if self.vpn_prompt_open || self.close_state != WindowClose::Open {
             return;
         }
         self.vpn_prompt_open = true;
@@ -539,7 +549,7 @@ impl Workbench {
     }
 
     fn on_sidebar(&mut self, ev: &SidebarEvent, window: &mut Window, cx: &mut Context<Self>) {
-        if self.closing { return; }
+        if self.close_state != WindowClose::Open { return; }
         match ev {
             SidebarEvent::Connect(key) => {
                 let Some(c) = connection(&self.projects.borrow(), key) else { return };
@@ -908,7 +918,7 @@ impl Workbench {
         let Some(project) = self.project_recovery.front_mut() else {
             return;
         };
-        if project.locating || self.closing {
+        if project.locating || self.close_state != WindowClose::Open {
             return;
         }
         let mut workspace = self.workspace.clone();
@@ -1032,6 +1042,7 @@ impl Workbench {
 
     /// Reload projects whose files changed outside the app.
     fn poll_watcher(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.close_state != WindowClose::Open { return; }
         let Some(w) = &self.watcher else { return };
         let changed = w.take_changed();
         if changed.is_empty() {
@@ -1190,6 +1201,7 @@ impl Workbench {
     }
 
     fn show_file(&mut self, path: PathBuf, text: String, window: &mut Window, cx: &mut Context<Self>) {
+        if self.close_state != WindowClose::Open { return; }
         if let Some(ix) = self.tabs.iter().position(|t| t.read(cx).path.as_ref() == Some(&path)) {
             self.active = ix;
             self.focus_editor(window, cx);
@@ -1256,30 +1268,130 @@ impl Workbench {
     }
 
     fn save_script(&mut self, tab: Entity<QueryTab>, path: PathBuf, text: String, expected: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
-        if tab.read(cx).saving { return; }
+        if self.close_state != WindowClose::Open || tab.read(cx).saving { return; }
         let t = tab.read(cx);
         let project = project_for_path(&self.projects.borrow(), &path);
         if project != t.project && (t.txn.in_txn || t.is_running()) {
             error(window, cx, "Finish the query and commit or roll back before saving into another project.");
             return;
         }
-        tab.update(cx, |t, _| t.saving = true);
+        self.write_scripts(vec![ScriptSave { tab, path, text, expected }], window, cx);
+    }
+
+    fn write_scripts(&mut self, saves: Vec<ScriptSave>, window: &mut Window, cx: &mut Context<Self>) {
+        for save in &saves {
+            save.tab.update(cx, |t, _| t.saving = true);
+        }
         cx.spawn_in(window, async move |this, cx| {
-            let (target, contents) = (path.clone(), text.clone());
-            let result = cx.background_executor().spawn(async move {
-                nbq_core::files::save_script(&target, &contents, expected.as_deref())
+            let results = cx.background_executor().spawn(async move {
+                // Save in order so two paths to the same file cannot race the revision check.
+                saves.into_iter().map(|save| {
+                    let result = nbq_core::files::save_script(&save.path, &save.text, save.expected.as_deref());
+                    (save, result)
+                }).collect::<Vec<_>>()
             }).await;
             let _ = this.update_in(cx, |wb, window, cx| {
-                tab.update(cx, |t, _| t.saving = false);
-                match result {
-                    Ok(()) => {
-                        tab.update(cx, |t, cx| t.mark_saved(path, text, cx));
-                        wb.sidebar.update(cx, |s, cx| s.refresh(cx));
+                let closing = wb.close_state == WindowClose::Saving;
+                let mut failures = Vec::new();
+                let mut saved = 0;
+                for (ScriptSave { tab, path, text, .. }, result) in results {
+                    tab.update(cx, |t, _| t.saving = false);
+                    match result {
+                        Ok(()) => {
+                            tab.update(cx, |t, cx| t.mark_saved(path, text, cx));
+                            saved += 1;
+                        }
+                        Err(e) if closing => failures.push((tab, path, e)),
+                        Err(e) => {
+                            let name = path.file_name().unwrap_or(path.as_os_str()).to_string_lossy();
+                            error(window, cx, format!("Could not save {name}. {e}"));
+                        }
                     }
-                    Err(e) => error(window, cx, format!("Save failed: {e}")),
                 }
+                if !failures.is_empty() {
+                    wb.keep_window_open(failures, saved, window, cx);
+                }
+                if wb.close_state == WindowClose::Open {
+                    wb.sidebar.update(cx, |s, cx| s.refresh(cx));
+                }
+                wb.advance_close(window, cx);
             });
         }).detach();
+    }
+
+    fn keep_window_open(
+        &mut self,
+        failures: Vec<(Entity<QueryTab>, PathBuf, std::io::Error)>,
+        saved: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.close_state = WindowClose::Open;
+        let Some((first_tab, _, _)) = failures.first() else { return };
+        if let Some(index) = self.tabs.iter().position(|tab| tab == first_tab) {
+            self.active = index;
+            self.focus_editor(window, cx);
+        }
+        cx.notify();
+
+        let tab = first_tab.downgrade();
+        let owner = cx.weak_entity();
+        let remaining = failures.len().saturating_sub(3);
+        let details: Vec<_> = failures.iter().take(3).map(|(_, path, error)| {
+            let filename = path.file_name().unwrap_or(path.as_os_str()).to_string_lossy();
+            (SharedString::from(filename.into_owned()), SharedString::from(error.to_string()))
+        }).collect();
+        let summary = if saved == 0 {
+            "Your edits are still in the editor."
+        } else {
+            "Other scripts saved. Your edits are still here."
+        };
+        window.push_notification(
+            Notification::new()
+                .id::<CloseSaveFailure>()
+                .with_type(NotificationType::Error)
+                .placement(Anchor::BottomRight)
+                .mb_6()
+                .bg(cx.theme().muted)
+                .title("Window stayed open")
+                .autohide(false)
+                .content(move |_, _, cx| {
+                    let (tab, owner) = (tab.clone(), owner.clone());
+                    let muted = cx.theme().muted_foreground;
+                    v_flex().gap_2().pt_1().text_sm()
+                        .children(details.iter().map(|(filename, reason)| {
+                            v_flex()
+                                .child(div().font_weight(FontWeight::SEMIBOLD).child(filename.clone()))
+                                .child(div().text_color(muted).child(reason.clone()))
+                        }))
+                        .when(remaining > 0, |element| {
+                            element.child(div().text_color(muted).child(format!("{remaining} more unsaved")))
+                        })
+                        .child(div().text_color(muted).child(summary))
+                        .child(h_flex().justify_end().child(
+                            Button::new("save-conflicted-script-as")
+                                .outline().small().label("Save As…")
+                                .bg(cx.theme().background)
+                                .border_color(muted.opacity(0.55))
+                                .on_click(cx.listener(move |notice, _, window, cx| {
+                                    let Some(tab) = tab.upgrade() else {
+                                        notice.dismiss(window, cx);
+                                        return;
+                                    };
+                                    let _ = owner.update(cx, |wb, cx| {
+                                        if let Some(index) = wb.tabs.iter().position(|open| *open == tab) {
+                                            wb.active = index;
+                                            wb.save(true, window, cx);
+                                            cx.notify();
+                                        }
+                                    });
+                                    notice.dismiss(window, cx);
+                                })),
+                        ))
+                        .into_any_element()
+                }),
+            cx,
+        );
     }
 
     fn open_dialog_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1305,6 +1417,7 @@ impl Workbench {
 
     /// Run a command by action (used by key bindings and the palette).
     fn perform(&mut self, action: &dyn Action, window: &mut Window, cx: &mut Context<Self>) {
+        if self.close_state != WindowClose::Open { return; }
         let a = action.as_any();
         if a.is::<ToggleAssistant>() {
             self.assistant_open = !self.assistant_open;
@@ -1368,8 +1481,15 @@ impl Workbench {
     }
 
     fn tree_operation(&mut self, from: Option<PathBuf>, to: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        if self.close_state != WindowClose::Open { return; }
         let Some(mut project) = self.projects.borrow().iter().find(|p| to.starts_with(&p.root)).cloned() else { return; };
         if self.tabs.iter().any(|tab| tab.read(cx).saving) { error(window, cx, "Wait for the script save to finish before moving files."); return; }
+        let moving_tabs: Vec<_> = self.tabs.iter().filter(|tab| {
+            from.as_ref().is_some_and(|from| tab.read(cx).path.as_ref().is_some_and(|path| path.starts_with(from)))
+        }).cloned().collect();
+        for tab in &moving_tabs {
+            tab.update(cx, |t, _| t.saving = true);
+        }
         let original = from.clone();
         let destination = to.clone();
         let task = cx.background_executor().spawn(async move {
@@ -1385,10 +1505,19 @@ impl Workbench {
                     Ok(()) => {
                         if let Some(p) = wb.projects.borrow_mut().iter_mut().find(|p| p.key == project.key) { *p = project; }
                         if let Some(from) = original {
+                            let remap = |path: &Path| {
+                                let tail = path.strip_prefix(&from).ok()?;
+                                // Joining an empty path adds a trailing separator on Windows.
+                                Some(if tail.as_os_str().is_empty() {
+                                    destination.clone()
+                                } else {
+                                    destination.join(tail)
+                                })
+                            };
                             for tab in &wb.tabs {
                                 tab.update(cx, |t, cx| {
-                                    if let Some(path) = t.path.as_ref().and_then(|p| p.strip_prefix(&from).ok()).map(|tail| destination.join(tail)) { t.set_path(path, cx); }
-                                    if let Some(path) = t.save_dir.as_ref().and_then(|p| p.strip_prefix(&from).ok()).map(|tail| destination.join(tail)) { t.save_dir = Some(path); }
+                                    if let Some(path) = t.path.as_deref().and_then(remap) { t.set_path(path, cx); }
+                                    if let Some(path) = t.save_dir.as_deref().and_then(remap) { t.save_dir = Some(path); }
                                 });
                             }
                         }
@@ -1396,6 +1525,10 @@ impl Workbench {
                         cx.notify();
                     }
                 }
+                for tab in moving_tabs {
+                    tab.update(cx, |t, _| t.saving = false);
+                }
+                wb.advance_close(window, cx);
             });
         }).detach();
     }
@@ -1437,7 +1570,7 @@ impl Workbench {
 
     fn rename_tab(&mut self, tab: Entity<QueryTab>, window: &mut Window, cx: &mut Context<Self>) {
         use gpui_kit::component::input::{Input, InputState};
-        if tab.read(cx).saving { return; }
+        if self.close_state != WindowClose::Open || tab.read(cx).saving { return; }
         let saved = tab.read(cx).path.is_some();
         let directory = tab.read(cx).path.as_ref().and_then(|p| p.parent().map(Path::to_path_buf))
             .or_else(|| tab.read(cx).save_dir.clone()).or_else(|| self.project_scripts_dir(tab.read(cx).project));
@@ -1462,7 +1595,7 @@ impl Workbench {
                     }
                     owner.update(cx, |wb, cx| {
                         let t = tab.read(cx);
-                        if t.saving { return; }
+                        if wb.close_state != WindowClose::Open || t.saving { return; }
                         if let Some(from) = t.path.clone() {
                             let mut to = from.with_file_name(&name);
                             if to.extension().is_none() { if let Some(ext) = from.extension() { to.set_extension(ext); } }
@@ -1478,7 +1611,7 @@ impl Workbench {
                                             // Windows rename refuses to replace an existing file.
                                             std::fs::rename(&from, &destination)
                                         }).await;
-                                        let _ = this.update_in(cx, |_, window, cx| {
+                                        let _ = this.update_in(cx, |wb, window, cx| {
                                             tab.update(cx, |t, cx| {
                                                 t.saving = false;
                                                 match result {
@@ -1486,6 +1619,7 @@ impl Workbench {
                                                     Err(e) => error(window, cx, format!("Rename failed: {e}")),
                                                 }
                                             });
+                                            wb.advance_close(window, cx);
                                             cx.notify();
                                         });
                                     }).detach();
@@ -1703,6 +1837,11 @@ impl Render for Workbench {
             }))
             .key_context("Workbench")
             .track_focus(&self.focus)
+            .when(self.close_state != WindowClose::Open, |root| {
+                root.capture_key_down(|_, _, cx| cx.stop_propagation())
+                    .capture_any_mouse_down(|_, _, cx| cx.stop_propagation())
+                    .capture_any_mouse_up(|_, _, cx| cx.stop_propagation())
+            })
             .size_full()
             .bg(theme.background)
             .text_color(theme.foreground);
@@ -1713,7 +1852,9 @@ impl Render for Workbench {
             ToggleTheme, ToggleAssistant
         );
         root.child(
-            TitleBar::new().child(
+            TitleBar::new().on_close_window(cx.listener(|this, _, window, cx| {
+                this.request_close(window, cx);
+            })).child(
                 h_flex()
                     .gap_2()
                     .items_center()
