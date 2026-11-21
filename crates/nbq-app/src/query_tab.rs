@@ -152,6 +152,47 @@ impl QueryTab {
         self.running.is_some()
     }
 
+    fn toggle_comment(
+        &mut self,
+        _: &crate::actions::ToggleSqlComment,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let dialect = self.split_opts().dialect;
+        self.editor.update(cx, |editor, cx| {
+            if !editor.focus_handle(cx).is_focused(window) || !editor.is_editable() {
+                cx.propagate();
+                return;
+            }
+
+            let text = editor.text();
+            let selection = editor.selected_range();
+            let first_row = text.offset_to_point(selection.start).row;
+            // A selection ending at column zero excludes that final line.
+            let last_byte = if selection.is_empty() {
+                selection.end
+            } else {
+                selection.end - 1
+            };
+            let last_row = text.offset_to_point(last_byte).row;
+            let start = text.line_start_offset(first_row);
+            let end = text.line_start_offset(last_row + 1);
+            let lines = text.slice(start..end).to_string();
+            let local_selection = selection.start - start..selection.end - start;
+            let (replacement, selection) =
+                crate::sql_comments::toggle(&lines, local_selection, dialect);
+            let range = text.offset_to_offset_utf16(start)..text.offset_to_offset_utf16(end);
+            let reversed = editor.is_selection_reversed();
+
+            editor.replace_text_in_range(Some(range), &replacement, window, cx);
+            editor.set_selected_range_with_direction(
+                start + selection.start..start + selection.end,
+                reversed,
+                cx,
+            );
+        });
+    }
+
     fn clipboard_line(&mut self, cut: bool, window: &mut Window, cx: &mut Context<Self>) {
         let editor = self.editor.read(cx);
         if !editor.focus_handle(cx).is_focused(window) || editor.is_copyable() {
@@ -840,6 +881,7 @@ impl Render for QueryTab {
                                 .child(
                                     div()
                                         .key_context("SqlEditor")
+                                        .on_action(cx.listener(Self::toggle_comment))
                                         .capture_action(cx.listener(|this, _: &Copy, window, cx| {
                                             this.clipboard_line(false, window, cx);
                                         }))

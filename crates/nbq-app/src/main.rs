@@ -10,6 +10,7 @@ mod csv_dialog;
 mod grid;
 mod query_tab;
 mod sidebar;
+mod sql_comments;
 mod ui;
 mod vpn;
 mod workbench;
