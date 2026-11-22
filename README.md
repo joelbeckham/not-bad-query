@@ -4,4 +4,4 @@ A minimal, keyboard-driven SQL client for PostgreSQL, Redshift, MySQL, SQLite, a
 
 Run locally with `cargo run -p nbq-app`.
 
-![SQL editor and results grid showing sample sales data](design/reviews/csv-results-final.png)
+![Sample project with Skills expanded to show shop-reporting and its SKILL.md file](design/reviews/skills-sidebar-final.png)
