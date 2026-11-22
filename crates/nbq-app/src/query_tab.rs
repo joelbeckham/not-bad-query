@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::input::{Copy, Cut, Editor, EditorState, InputEvent, RopeExt as _};
+use gpui_kit::component::input::{Copy, Cut, Editor, EditorState, InputEvent, Rope, RopeExt as _};
 use gpui_kit::component::link::Link;
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
@@ -26,6 +26,16 @@ use nbq_sql::{SplitOptions, split, statement_at};
 use crate::complete::{Catalogs, SqlCompleter};
 use crate::grid::ResultGrid;
 use crate::ui::{Projects, conn_color, fmt_count, fmt_elapsed};
+
+const SQL_LINE_CLIPBOARD: &str = "not-bad-query/sql-line";
+
+fn line_break_before(text: &Rope, offset: usize) -> &'static str {
+    if offset >= 2 && text.byte(offset - 2) == b'\r' {
+        "\r\n"
+    } else {
+        "\n"
+    }
+}
 
 pub enum Status {
     Idle,
@@ -217,17 +227,13 @@ impl QueryTab {
             if row == 0 {
                 line.push('\n');
             } else {
-                let newline = if start >= 2 && text.byte(start - 2) == b'\r' {
-                    "\r\n"
-                } else {
-                    "\n"
-                };
+                let newline = line_break_before(text, start);
                 cut_start -= newline.len();
                 line.push_str(newline);
             }
         }
 
-        cx.write_to_clipboard(ClipboardItem::new_string(line));
+        cx.write_to_clipboard(ClipboardItem::new_string_with_metadata(line, SQL_LINE_CLIPBOARD.into()));
         if cut {
             self.editor.update(cx, |editor, cx| {
                 let text = editor.text();
@@ -236,6 +242,49 @@ impl QueryTab {
             });
         }
         cx.stop_propagation();
+    }
+
+    fn paste_line(
+        editor: &Entity<EditorState>,
+        clipboard: &ClipboardItem,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> bool {
+        if clipboard.metadata().map(String::as_str) != Some(SQL_LINE_CLIPBOARD) {
+            return false;
+        }
+        let state = editor.read(cx);
+        if !state.focus_handle(cx).is_focused(window) || !state.is_editable() || state.is_copyable() {
+            return false;
+        }
+        let text = state.text();
+        if text.len() == 0 {
+            return false;
+        }
+        let Some(line) = clipboard.text() else { return false };
+        let Some(content) = line.strip_suffix("\r\n").or_else(|| line.strip_suffix('\n')) else {
+            return false;
+        };
+
+        let row = text.offset_to_point(state.cursor()).row;
+        let next = text.line_start_offset(row + 1);
+        let (insertion, caret) = if row + 1 < text.lines_len() {
+            let newline = line_break_before(text, next);
+            (format!("{content}{newline}"), next + content.len())
+        } else {
+            let newline = if row == 0 {
+                &line[content.len()..]
+            } else {
+                line_break_before(text, text.line_start_offset(row))
+            };
+            (format!("{newline}{content}"), next + newline.len() + content.len())
+        };
+        let offset = text.offset_to_offset_utf16(next);
+        editor.update(cx, |state, cx| {
+            state.replace_text_in_range(Some(offset..offset), &insertion, window, cx);
+            state.set_selected_range(caret..caret, cx);
+        });
+        true
     }
 
     pub fn set_connection(&mut self, conn: Option<Connection>, cx: &mut Context<Self>) {
@@ -889,7 +938,17 @@ impl Render for QueryTab {
                                             this.clipboard_line(true, window, cx);
                                         }))
                                         .size_full()
-                                        .child(Editor::new(&self.editor).bordered(false).h(relative(1.))),
+                                        .child(
+                                            Editor::new(&self.editor)
+                                                .bordered(false)
+                                                .h(relative(1.))
+                                                .on_paste({
+                                                    let editor = self.editor.clone();
+                                                    move |clipboard, window, cx| {
+                                                        Self::paste_line(&editor, clipboard, window, cx)
+                                                    }
+                                                }),
+                                        ),
                                 )
                         )
                         .child(resizable_panel().child(results.into_any_element())),
